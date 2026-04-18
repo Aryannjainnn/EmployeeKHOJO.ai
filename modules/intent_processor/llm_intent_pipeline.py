@@ -250,6 +250,63 @@ Generate 6-10 diverse query variants using these strategies:
 3. decomposition : split multi-facet queries into focused single-dimension queries
 4. hyde          : write what a PERFECT matching candidate profile would say (3-4 sentences)
 5. role_variant  : rephrase using role title variants
+6. related_tech  : PRIORITY STRATEGY — always generate AT LEAST 3 related_tech variants.
+                   For every detected skill or role, expand into its most commonly co-occurring
+                   tools, frameworks, and libraries. Use the mappings below as your guide,
+                   but also infer related technologies from context even if not listed.
+
+   RELATED TECH EXPANSION REFERENCE (mandatory — apply aggressively):
+   Python      → Django, FastAPI, Flask, SQLAlchemy, Celery, Pydantic, NumPy, Pandas
+   JavaScript  → React, Vue, Angular, Node.js, Express, Next.js, TypeScript, Webpack
+   TypeScript  → React, Next.js, NestJS, Angular, Node.js, Zod, tRPC
+   Java        → Spring Boot, Hibernate, Maven, Gradle, JUnit, Kafka, Microservices
+   Go / Golang → Gin, Echo, gRPC, Docker, Kubernetes, REST APIs, Prometheus
+   Rust        → Tokio, Actix-web, WebAssembly, systems programming, embedded
+   C++         → STL, Boost, OpenCV, Unreal Engine, embedded systems, CUDA
+   Ruby        → Rails, Sinatra, RSpec, Sidekiq, ActiveRecord
+   PHP         → Laravel, Symfony, WordPress, Composer, MySQL
+   Scala       → Spark, Akka, Play Framework, Functional programming, Kafka
+   Kotlin      → Spring Boot, Android, Coroutines, Ktor, Jetpack Compose
+   Swift       → iOS, SwiftUI, UIKit, Combine, Xcode, CoreData
+
+   React       → Redux, React Query, Next.js, TypeScript, Tailwind, Jest, Vite
+   Vue         → Vuex, Pinia, Nuxt.js, TypeScript, Vite, Vue Router
+   Angular     → RxJS, NgRx, TypeScript, Angular Material, Jasmine
+   Node.js     → Express, NestJS, Fastify, GraphQL, REST APIs, TypeScript
+
+   Machine Learning → Scikit-learn, XGBoost, PyTorch, TensorFlow, MLflow, Pandas, NumPy
+   Deep Learning    → PyTorch, TensorFlow, Keras, CUDA, Transformers, ONNX, JAX
+   NLP / LLM        → HuggingFace Transformers, LangChain, LlamaIndex, OpenAI API,
+                       RAG, RLHF, LoRA, PEFT, FAISS, ChromaDB, Pinecone
+   Computer Vision  → OpenCV, YOLO, Detectron2, PyTorch, TensorFlow, PIL, torchvision
+   Data Science     → Pandas, NumPy, Matplotlib, Seaborn, Jupyter, SQL, Scikit-learn
+   Data Engineering → Apache Spark, Kafka, Airflow, dbt, Snowflake, Databricks,
+                       BigQuery, Redshift, Fivetran, dbt, Flink
+
+   AWS         → EC2, S3, Lambda, EKS, RDS, CloudFormation, CDK, SageMaker
+   GCP         → BigQuery, GKE, Cloud Run, Vertex AI, Pub/Sub, Cloud Functions
+   Azure       → AKS, Azure Functions, Cosmos DB, Azure DevOps, Azure ML
+   Kubernetes  → Helm, ArgoCD, Kustomize, Prometheus, Grafana, Istio, Docker
+   DevOps      → Docker, Kubernetes, Terraform, Ansible, Jenkins, GitHub Actions,
+                  ArgoCD, Prometheus, Grafana, ELK Stack
+   MLOps       → MLflow, Kubeflow, Airflow, Docker, Kubernetes, DVC, Weights & Biases
+
+   PostgreSQL  → PostGIS, pgAdmin, SQLAlchemy, Prisma, TypeORM, read replicas
+   MongoDB     → Mongoose, Atlas, aggregation pipeline, sharding
+   Redis       → Caching, Pub/Sub, Celery, session management, rate limiting
+   Kafka       → Spark Streaming, Flink, consumer groups, event-driven architecture
+
+   Fullstack   → React or Vue frontend + Node.js or Python backend + PostgreSQL or MongoDB
+   Mobile      → React Native or Flutter + REST APIs + Firebase or Supabase
+   Blockchain  → Solidity, Ethereum, Web3.js, Hardhat, Smart Contracts, IPFS
+
+   RULES FOR related_tech:
+   - Always generate AT LEAST 3 expanded_queries using this strategy
+   - Each related_tech query should name 2-4 specific associated technologies
+   - Do NOT just repeat the original skill — add the ecosystem around it
+   - If a query mentions a role (e.g. "backend engineer"), expand using the most
+     common tech stacks for that role even if no specific skill was named
+   - Tag each such query as "related_tech" in query_strategies
 
 NEGATION RULES:
 - "not java", "no java", "without java", "excluding java" → java goes to negated_skills
@@ -282,15 +339,17 @@ Exact schema:
   "modifiers": ["additional intent values that also apply"],
   "intent_reasoning": "1-2 sentences explaining why this intent was chosen",
   "top3_scores": {"intent_name": score, ...},
-  "expanded_queries": ["query string 1", "query string 2", ...],
+  "expanded_queries_standard": ["query string 1", "query string 2", ...],
+  "expanded_queries_related_tech": ["query string 1 with frameworks", "query string 2 with libraries", ...],
   "query_strategies": {"query string 1": "strategy_name", ...},
   "exclusion_filters": {"must_not_skills": [...], "must_not_location": "..."}
 }
 
 RULES:
-- expanded_queries must have 6-10 items
+- expanded_queries_standard must have 4-6 items
+- expanded_queries_related_tech must have 3-4 items based on the RELATED TECH map
 - hyde strategy generates a short candidate profile paragraph (not a query keyword string)
-- negated_skills and negated_location must NOT appear in expanded_queries
+- negated_skills and negated_location must NOT appear in any expanded queries
 - primary_intent must be exactly one of the intent class strings
 - modifiers is a list of additional applicable intent strings (can be empty list)
 - top3_scores must have exactly 3 entries
@@ -606,6 +665,20 @@ def _validate_and_fill(data: dict, original_query: str) -> dict:
         data["confidence"] = max(0.0, min(1.0, float(data["confidence"])))
     except (TypeError, ValueError):
         data["confidence"] = 0.5
+
+    # Merge forced schema keys into the standard expanded_queries list
+    standard_q = data.pop("expanded_queries_standard", [])
+    related_q  = data.pop("expanded_queries_related_tech", [])
+    
+    # Ensure they are lists
+    if not isinstance(standard_q, list): standard_q = []
+    if not isinstance(related_q, list): related_q = []
+    
+    merged_queries = standard_q + related_q
+    if not merged_queries:
+        merged_queries = data.get("expanded_queries", [])
+        
+    data["expanded_queries"] = merged_queries
 
     # Ensure expanded_queries is a non-empty list
     if not isinstance(data.get("expanded_queries"), list) or not data["expanded_queries"]:
