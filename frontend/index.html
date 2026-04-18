@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>HR Candidate Retrieval</title>
+<style>
+  :root { --fg:#222; --muted:#666; --bg:#fafafa; --card:#fff; --accent:#2a6df4; --line:#e6e6e6; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--fg); background:var(--bg); }
+  header { padding:24px 28px; border-bottom:1px solid var(--line); background:#fff; }
+  h1 { margin:0 0 4px; font-size:20px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; }
+  main { max-width:1100px; margin:0 auto; padding:24px 20px; }
+  .searchbar { display:flex; gap:8px; margin-bottom:18px; }
+  .searchbar input { flex:1; padding:12px 14px; border:1px solid var(--line); border-radius:8px; font-size:15px; background:#fff; }
+  .searchbar button { padding:0 18px; background:var(--accent); color:#fff; border:0; border-radius:8px; cursor:pointer; font-weight:600; }
+  .searchbar button:disabled { opacity:.6; cursor:wait; }
+  .meta { display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--muted); margin-bottom:12px; }
+  .meta span b { color:var(--fg); }
+  .process { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:16px; font-size:13px; color:var(--muted); }
+  .process b { color:var(--fg); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:10px; }
+  .card h3 { margin:0 0 4px; font-size:15px; }
+  .tag { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; margin-left:8px; text-transform:uppercase; letter-spacing:.3px; }
+  .tag-hybrid { background:#eaf2ff; color:#1b4fd6; }
+  .tag-kg     { background:#eafff0; color:#0f7a3d; }
+  .tag-both   { background:#fff3e0; color:#a15c00; }
+  .reasons { margin:6px 0 0 0; padding:0 0 0 18px; color:var(--muted); font-size:13px; }
+  .reasons li { margin:2px 0; }
+  .error { background:#fff0f0; color:#a40000; border:1px solid #f3c5c5; padding:10px 14px; border-radius:8px; }
+  pre.debug { background:#fff; border:1px solid var(--line); padding:10px; border-radius:8px; font-size:11px; max-height:220px; overflow:auto; }
+  details summary { cursor:pointer; color:var(--muted); font-size:12px; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Intent-Aware Candidate Retrieval</h1>
+  <div class="sub">HR shortlisting · hybrid (BM25 + SBERT) + knowledge graph · explainable</div>
+</header>
+<main>
+  <div class="searchbar">
+    <input id="q" placeholder="e.g. senior backend engineer with aws and flask, 7+ years" autofocus />
+    <button id="go">Search</button>
+  </div>
+
+  <div id="meta"    class="meta"    style="display:none"></div>
+  <div id="process" class="process" style="display:none"></div>
+  <div id="results"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function search() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("go").disabled = true;
+  $("results").innerHTML = "";
+  $("meta").style.display = "none";
+  $("process").style.display = "none";
+
+  try {
+    const res = await fetch("/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "request failed");
+    render(data);
+  } catch (e) {
+    $("results").innerHTML = `<div class="error">${e.message}</div>`;
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+function render(data) {
+  const t = data.trace || {};
+  $("meta").style.display = "flex";
+  $("meta").innerHTML = `
+    <span>intent: <b>${data.intent?.intent?.primary_intent ?? "?"}</b></span>
+    <span>queries: <b>${(data.intent?.queries || []).length}</b></span>
+    <span>hybrid hits: <b>${t.hybrid_n ?? "?"}</b></span>
+    <span>kg hits: <b>${t.kg_n ?? "?"}</b></span>
+    <span>overlap: <b>${t.overlap_n ?? "?"}</b></span>
+    <span>total: <b>${t.total_ms ?? "?"} ms</b></span>
+  `;
+
+  const proc = data.explanations?.process_summary;
+  if (proc) {
+    $("process").style.display = "block";
+    $("process").innerHTML = `<b>What happened:</b> ${proc}`;
+  }
+
+  const ranked = data.reranked?.ranked || [];
+  const perCand = data.explanations?.per_candidate || {};
+  if (!ranked.length) {
+    $("results").innerHTML = `<div class="error">no candidates returned</div>`;
+    return;
+  }
+  $("results").innerHTML = ranked.map((c) => {
+    const exp = perCand[c.id] || {};
+    const reasons = (exp.reasons || []).map(r => `<li>${escape(r)}</li>`).join("");
+    return `
+      <div class="card">
+        <h3>${escape(c.name || c.id)}
+          <span class="tag tag-${c.source}">${c.source}</span>
+        </h3>
+        <div class="sub">id: ${escape(c.id)} · score: ${(c.final_score ?? c.score ?? 0).toFixed?.(3) ?? c.final_score ?? c.score}</div>
+        ${exp.summary ? `<div style="margin-top:6px">${escape(exp.summary)}</div>` : ""}
+        ${reasons ? `<ul class="reasons">${reasons}</ul>` : ""}
+      </div>
+    `;
+  }).join("");
+
+  const debug = document.createElement("details");
+  debug.innerHTML = `<summary>raw response</summary><pre class="debug">${escape(JSON.stringify(data, null, 2))}</pre>`;
+  $("results").appendChild(debug);
+}
+
+function escape(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+$("go").addEventListener("click", search);
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+</script>
+</body>
+</html>

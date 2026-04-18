@@ -1,0 +1,11 @@
+.env
+.env.example
+__pycache__/
+*.pyc
+*.pkl
+data/*.pkl
+data/profiles.csv
+*_checkpoint.json
+.venv/
+venv/
+.DS_Store
