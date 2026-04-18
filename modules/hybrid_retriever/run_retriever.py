@@ -154,7 +154,7 @@ def main() -> None:
     parser.add_argument("--index",   default=".", help="Path to index_store/ directory")
     parser.add_argument("--intent",  required=True,         help="Path to intent JSON file")
     parser.add_argument("--output",  default="results.json",help="Path to output JSON file")
-    parser.add_argument("--top-k",   type=int, default=20,  help="Number of results per mode")
+    parser.add_argument("--top-k",   type=int, default=50,   help="Number of results per mode (use 200 to match KG recall)")
     parser.add_argument("--demo",    action="store_true",   help="Build mock index first (for testing)")
     parser.add_argument("--csv",     default="profiles.csv",help="CSV path (only needed with --demo)")
     args = parser.parse_args()

@@ -81,10 +81,34 @@ EXPERIENCE_BAND_MIN = {
 }
 
 # Maximum candidates to return
-DEFAULT_TOP_K = 20
+DEFAULT_TOP_K    = 50    # raised from 20 — match KG recall level
 
 # SBERT model — swappable
 SBERT_MODEL = "all-MiniLM-L6-v2"
+
+# Stopwords — excluded from BM25 query tokens to avoid noise matches.
+# These are generic words that appear in every job description and add no signal.
+STOPWORDS: frozenset[str] = frozenset({
+    # English function words
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "as", "is", "are", "was", "were", "be",
+    "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "shall", "can", "not",
+    "no", "nor", "so", "yet", "this", "that", "it", "its", "my", "your",
+    "he", "she", "we", "they", "them", "their", "our", "than", "then",
+    "there", "here", "when", "where", "who", "which", "what", "how",
+    "if", "about", "up", "out", "into", "over", "after", "also",
+    # Recruitment boilerplate — carry zero signal for skill matching
+    "senior", "junior", "mid", "level", "entry", "lead", "principal",
+    "years", "year", "yrs", "yr", "experience", "experienced",
+    "candidate", "candidates", "someone", "person", "professional",
+    "role", "roles", "position", "job", "looking", "need", "required",
+    "require", "seeking", "find", "want", "skills", "skill",
+    "proficient", "competent", "expert", "beginner", "advanced",
+    "suitable", "background", "strong", "good",
+    # Numbers / units
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+})
 
 
 # ============================================================================
@@ -183,11 +207,11 @@ class BM25Engine:
         return scores, term_scores
 
     def tokenize(self, text: str) -> list[str]:
-        # Simple fallback
+        # Simple fallback — strips stopwords so filler words don't pollute BM25
         if not self.normalizer:
             text = text.lower()
             text = re.sub(r"[^a-z0-9\s]", " ", text)
-            return [t for t in text.split() if len(t) > 1]
+            return [t for t in text.split() if len(t) > 1 and t not in STOPWORDS]
             
         # Use canonical normalizer logic
         text = text.lower()
@@ -216,6 +240,8 @@ class BM25Engine:
         # We'll just map individual words and bigrams if possible, or fallback to the exact dict
         
         for w in words:
+            if w in STOPWORDS:
+                continue
             if w in syn_map:
                 tokens.append(syn_map[w].replace(' ', '_'))
             else:
@@ -227,7 +253,7 @@ class BM25Engine:
             if phrase in full_text:
                 tokens.append(canonical.replace(' ', '_'))
                 
-        return list(set(tokens))
+        return [t for t in set(tokens) if t not in STOPWORDS]
 
 
 # ============================================================================
@@ -358,8 +384,8 @@ def passes_experience_filter(
     if experience_years:
         try:
             req = float(experience_years)
-            # Allow ±1 year tolerance (don't hard-reject borderline candidates)
-            if cand_years < req - 1.5:
+            # Allow ±2.5 year tolerance — don't hard-reject borderline candidates
+            if cand_years < req - 2.5:
                 return False
         except ValueError:
             pass
@@ -642,21 +668,44 @@ class HybridRetriever:
             if hit_count > 0:
                 rrf_scores[idx] *= (1.0 + 0.3 * hit_count)  # additive boost per hit
 
+        # BM25 floor: only candidates with a real keyword match pass (not noise)
+        # 0.25 = at least 25% of top BM25 score needed to enter hybrid.
+        # This drops candidates who only matched a single generic word like 'web' or 'services'.
+        bm25_floor = 0.25
+
         # Pure lexical scores
         lexical_scores = bm25_agg.copy()
         lexical_scores[~valid_mask] = 0.0
 
-        # Pure semantic scores
+        # Pure semantic scores — only candidates with cosine similarity >= 0.5 pass
+        sem_threshold = 0.5
         semantic_scores = dense_scores.copy()
         semantic_scores[~valid_mask] = 0.0
-        semantic_scores[semantic_scores < 0.5] = 0.0
+        semantic_scores[semantic_scores < sem_threshold] = 0.0
+
+        # Hybrid: candidate must pass at least one of BM25 or semantic threshold
+        # This prevents low-quality candidates from sneaking in via RRF fusion
+        hybrid_quality_mask = (bm25_agg >= bm25_floor) | (dense_scores >= sem_threshold)
+        rrf_scores[~hybrid_quality_mask] = 0.0
 
         # ---- 6. Build output records ----
+        # THRESHOLD STRATEGY: relative score floor
+        # We only keep candidates scoring >= SCORE_FLOOR_RATIO * top_score.
+        # This is query-adaptive: a weak query doesn't flood results with noise.
+        # Tune SCORE_FLOOR_RATIO:
+        #   0.10 → very permissive (more candidates, lower avg quality)
+        #   0.20 → balanced (recommended default)
+        #   0.40 → strict (fewer, higher quality)
+        SCORE_FLOOR_RATIO = 0.20
+
         def _build_records(score_arr: np.ndarray, mode: str) -> list[dict]:
-            top_idx = np.argsort(score_arr)[::-1][: self.top_k]
+            top_score = score_arr.max()
+            score_floor = top_score * SCORE_FLOOR_RATIO if top_score > 0 else 0.0
+            # Sort all docs by score descending; stop when score drops below floor
+            top_idx = np.argsort(score_arr)[::-1]
             records = []
             for rank, idx in enumerate(top_idx, start=1):
-                if score_arr[idx] <= 0:
+                if score_arr[idx] < score_floor:
                     break
                 cand = self.metadata[idx]
 

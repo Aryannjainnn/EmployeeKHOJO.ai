@@ -1,34 +1,83 @@
-# ─── API / orchestration ──────────────────────────────
-fastapi==0.115.0
+# ───────────────── Core numerical (FAISS-safe) ─────────────────
+numpy==1.26.4
+pandas==2.2.3
+python-dateutil>=2.8.2
+tzdata>=2024.1
+
+# ───────────────── API / orchestration ─────────────────────────
+fastapi==0.115.2
+starlette==0.40.0
 uvicorn[standard]==0.30.6
 python-dotenv==1.0.1
 pydantic==2.9.2
+typing-extensions>=4.9.0
+anyio>=3.7.1
+h11>=0.14.0
+
+# ───────────────── LangChain stack ─────────────────────────────
 langchain==0.3.4
 langchain-core==0.3.12
+langchain-community==0.3.3
+langsmith==0.1.147
+SQLAlchemy>=1.4
+aiohttp>=3.9.5
+pyyaml>=6.0.1
+orjson>=3.9.14
 
-# ─── Intent processor ────────────────────────────────
-# Local pipeline (intent_pipeline.py): BART NLI + SBERT + SymSpell
-torch>=2.2.0
-transformers>=4.44.0
+# ───────────────── Intent / NLP ────────────────────────────────
+torch==2.2.2
+transformers==4.44.2
 sentence-transformers==3.1.1
-symspellpy>=6.7.7
-# LLM pipeline (llm_intent_pipeline.py): Groq / Cerebras / OpenRouter / SambaNova
-# all OpenAI-compatible — just need the openai SDK
+symspellpy==6.7.7
 openai>=1.40.0
 
-# ─── Hybrid retrieval ─────────────────────────────────
+# Required sub-deps (missing earlier)
+tqdm>=4.66.0
+regex>=2024.5.15
+safetensors>=0.4.1
+tokenizers==0.19.1
+
+# ML dependencies
+scikit-learn>=1.3.0
+scipy>=1.11.0
+joblib>=1.3.0
+threadpoolctl>=3.1.0
+
+# ───────────────── Retrieval ───────────────────────────────────
 rank-bm25==0.2.2
 faiss-cpu==1.8.0.post1
-numpy==1.26.4
-pandas==2.2.3
 
-# ─── Knowledge graph ──────────────────────────────────
+# ───────────────── CV (numpy 1.x compatible) ───────────────────
+opencv-python==4.9.0.80
+opencv-contrib-python==4.9.0.80
+Pillow>=10.0.0
+
+# ───────────────── Graph DB ────────────────────────────────────
 neo4j==5.25.0
 
-# ─── LLM (local via Ollama) ───────────────────────────
+# ───────────────── Local LLM ───────────────────────────────────
 ollama==0.3.3
+httpx>=0.27.0
+httpcore>=1.0.0
 
-# ─── Watchers ─────────────────────────────────────────
+# ───────────────── Watchers / utils ────────────────────────────
 watchdog==5.0.3
 thefuzz==0.22.1
 python-Levenshtein==0.26.0
+
+# ───────────────── Misc fixes (from pip check errors) ──────────
+protobuf>=3.20.0,<5
+dill>=0.3.8
+networkx>=3.2.1
+click>=8.1.7
+rich>=13.7.0
+typer>=0.9.0
+platformdirs>=4.2.0
+annotated-types>=0.6.0
+mpmath>=1.3.0
+contourpy>=1.2.0
+cycler>=0.12.0
+kiwisolver>=1.4.5
+markupsafe>=2.1.5
+urllib3>=2.0.0
+requests>=2.31.0
