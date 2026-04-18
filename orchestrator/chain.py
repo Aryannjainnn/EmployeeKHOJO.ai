@@ -46,7 +46,12 @@ def _run_hybrid(payload: dict[str, Any]) -> dict[str, Any]:
     # Pass the full canonical intent dict — the hybrid retriever uses parsed
     # entities (negated_skills, experience_band, ...) for hard filtering, not
     # just the expanded queries.
-    result = hybrid_retrieve(payload["intent"])
+    # Tolerate failures: if hybrid crashes, the KG branch can still produce
+    # results and the pipeline stays usable while hybrid is being debugged.
+    try:
+        result = hybrid_retrieve(payload["intent"])
+    except Exception as e:
+        result = {"candidates": [], "_error": f"{type(e).__name__}: {e}"}
     result.setdefault("_timing_ms", round((time.time() - t0) * 1000, 1))
     return result
 
@@ -57,7 +62,10 @@ def _run_kg(payload: dict[str, Any]) -> dict[str, Any]:
     # Pass the full canonical intent dict — KGRetriever.retrieve uses parsed
     # entities (skills, negated_skills, experience_band, role, domain) for
     # traversal seeding, not just the expanded query strings.
-    result = kg_retrieve(payload["intent"])
+    try:
+        result = kg_retrieve(payload["intent"])
+    except Exception as e:
+        result = {"candidates": [], "_error": f"{type(e).__name__}: {e}"}
     result.setdefault("_timing_ms", round((time.time() - t0) * 1000, 1))
     return result
 

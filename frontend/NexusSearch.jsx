@@ -19,7 +19,9 @@
  *   Falls back to built-in demo data if the endpoint is unavailable.
  */
 
-import { useState, useEffect, useRef } from "react";
+// NOTE: served to the browser and compiled by @babel/standalone from index.html.
+// No bundler in the loop → pull hooks off the React global instead of ES-module imports.
+const { useState, useEffect, useRef } = React;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CSS-in-JS styles (injected once via <style> tag)
@@ -850,7 +852,7 @@ function ResultsView({ query, onNewSearch }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Root App
 // ─────────────────────────────────────────────────────────────────────────────
-export default function NexusSearch() {
+function NexusSearch() {
   const [query, setQuery] = useState(null);
 
   // Inject global CSS once
@@ -875,4 +877,12 @@ export default function NexusSearch() {
       </main>
     </div>
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mount — index.html loads this file via <script type="text/babel">
+// ─────────────────────────────────────────────────────────────────────────────
+const _rootEl = document.getElementById("root");
+if (_rootEl) {
+  ReactDOM.createRoot(_rootEl).render(<NexusSearch />);
 }

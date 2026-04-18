@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Nexus — Talent Intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+      html, body, #root { height: 100%; margin: 0; background: #06080d; color: #e2e8f4; font-family: 'DM Sans', sans-serif; }
+      /* Simple fallback while Babel compiles the JSX */
+      #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+              font-family: 'Space Mono', monospace; color: #4a5268; letter-spacing: 2px; font-size: 11px; }
+    </style>
+
+    <!-- React (UMD) + Babel Standalone for in-browser JSX compilation -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"><div id="boot">LOADING NEXUS…</div></div>
+
+    <!-- Babel compiles NexusSearch.jsx in the browser. No bundler needed. -->
+    <script type="text/babel" data-presets="react" src="/NexusSearch.jsx"></script>
+</body>
+</html>
