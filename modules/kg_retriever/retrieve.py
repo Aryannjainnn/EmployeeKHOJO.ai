@@ -26,6 +26,8 @@ import re
 import json
 import logging
 import argparse
+import threading                                                      # BUG 3 FIX
+from concurrent.futures import ThreadPoolExecutor, as_completed      # BUG 3 FIX
 from typing import Any
 from pathlib import Path
 
@@ -288,9 +290,16 @@ class KGRetriever:
         exp_yrs = _extract_experience_years(parsed)
 
         all_terms = self._collect_terms(expanded_query, skills, role, band)
+
+        # BUG 2 FIX (2a): Strip negated skills from search terms so they are
+        # never used as graph traversal seeds and never appear in matched_terms.
+        negated = {s.lower() for s in parsed.get("negated_skills", [])}
+        if negated:
+            all_terms = {t: v for t, v in all_terms.items() if t not in negated}
+
         logger.info(
-            "Retrieval - skills=%s | role=%s | band=%s | exp=%s | terms=%d",
-            skills, role, band, exp_yrs, len(all_terms),
+            "Retrieval - skills=%s | role=%s | band=%s | exp=%s | terms=%d | negated=%s",
+            skills, role, band, exp_yrs, len(all_terms), negated,
         )
 
         raw_hits = self._graph_search(all_terms, skills)
@@ -348,6 +357,21 @@ class KGRetriever:
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+
+        # BUG 2 FIX (2b): Post-filter — remove any candidate whose graph-side
+        # core_skills contain a negated skill. This catches candidates who
+        # slipped through via non-negated terms but genuinely have the
+        # unwanted skill in their profile.
+        if negated:
+            scored = [
+                c for c in scored
+                if not any(
+                    neg in skill.lower()
+                    for neg in negated
+                    for skill in c["core_skills"]
+                )
+            ]
+
         logger.info("Returning %d candidates", len(scored))
         return scored
 
@@ -401,26 +425,29 @@ class KGRetriever:
     ) -> dict[Any, dict]:
 
         hits: dict[Any, dict] = {}
+        lock = threading.Lock()                                        # BUG 3 FIX
 
+        # BUG 3 FIX: _add_hit is now thread-safe via lock
         def _add_hit(cid, query_term, matched_node, relationship, hops, weight):
-            if cid not in hits:
-                hits[cid] = {
-                    "graph_score":   0.0,
-                    "matched_terms": set(),
-                    "core_skills":   [],
-                    "match_reasons": [],
-                }
             decay       = HOP_DECAY ** (hops - 1)
             score_delta = round(weight * decay, 4)
-            hits[cid]["graph_score"]   += score_delta
-            hits[cid]["matched_terms"].add(query_term)
-            hits[cid]["match_reasons"].append({
-                "query_term":   query_term,
-                "matched_node": matched_node,
-                "relationship": relationship,
-                "hops":         hops,
-                "score_delta":  score_delta,
-            })
+            with lock:
+                if cid not in hits:
+                    hits[cid] = {
+                        "graph_score":   0.0,
+                        "matched_terms": set(),
+                        "core_skills":   [],
+                        "match_reasons": [],
+                    }
+                hits[cid]["graph_score"]   += score_delta
+                hits[cid]["matched_terms"].add(query_term)
+                hits[cid]["match_reasons"].append({
+                    "query_term":   query_term,
+                    "matched_node": matched_node,
+                    "relationship": relationship,
+                    "hops":         hops,
+                    "score_delta":  score_delta,
+                })
 
         # Ordered traversal pipeline: (cypher, weight_fn)
         skill_traversal = [
@@ -431,19 +458,27 @@ class KGRetriever:
             (CYPHER_HOP4_DEEP,    lambda t: W_RELATED_SKILL * HOP_DECAY * HOP_DECAY),
         ]
 
+        # BUG 3 FIX: Single task runner used by the thread pool
+        def _run_one(term, cypher, weight_fn, is_role=False):
+            rows = self._db.run(cypher, term=term)
+            w = W_ROLE_MATCH if is_role else weight_fn(term)
+            for r in rows:
+                _add_hit(r["candidate_id"], term, r["matched_node"],
+                         r["relationship"], r["hops"], w)
+
+        # BUG 3 FIX: Build the full task list upfront, then run in parallel.
+        # The Neo4j bolt driver creates a new session per call, so this is safe.
+        tasks = []
         for term, source in all_terms.items():
             for cypher, weight_fn in skill_traversal:
-                rows = self._db.run(cypher, term=term)
-                w    = weight_fn(term)
-                for r in rows:
-                    _add_hit(r["candidate_id"], term, r["matched_node"],
-                             r["relationship"], r["hops"], w)
-
+                tasks.append((term, cypher, weight_fn, False))
             if source in ("role", "skill"):
-                rows = self._db.run(CYPHER_HOP1_ROLE, term=term)
-                for r in rows:
-                    _add_hit(r["candidate_id"], term, r["matched_node"],
-                             r["relationship"], r["hops"], W_ROLE_MATCH)
+                tasks.append((term, CYPHER_HOP1_ROLE, None, True))
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(_run_one, *t) for t in tasks]
+            for f in as_completed(futures):
+                f.result()   # re-raise any exception from a worker thread
 
         if not hits:
             return {}

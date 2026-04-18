@@ -54,9 +54,10 @@ def _run_hybrid(payload: dict[str, Any]) -> dict[str, Any]:
 # ─── Stage 2b: kg (parallel branch) ──────────────────────────
 def _run_kg(payload: dict[str, Any]) -> dict[str, Any]:
     t0 = time.time()
-    # Prefer KG-specific expanded queries if the intent module produced them
-    kg_qs = payload["intent"].get("kg_expanded_queries") or payload["intent"].get("queries", [])
-    result = kg_retrieve(kg_qs)
+    # Pass the full canonical intent dict — KGRetriever.retrieve uses parsed
+    # entities (skills, negated_skills, experience_band, role, domain) for
+    # traversal seeding, not just the expanded query strings.
+    result = kg_retrieve(payload["intent"])
     result.setdefault("_timing_ms", round((time.time() - t0) * 1000, 1))
     return result
 
@@ -130,13 +131,13 @@ def _tag_and_combine(payload: dict[str, Any]) -> dict[str, Any]:
 # ─── Stage 4: rerank ─────────────────────────────────────────
 def _run_rerank(payload: dict[str, Any]) -> dict[str, Any]:
     t0 = time.time()
-    reranked = rerank_module({
-        "query": payload["query"],
-        "intent": payload["intent"],
-        "hybrid": payload["hybrid_raw"],
-        "kg": payload["kg_raw"],
-        "tagged_candidates": payload["tagged_candidates"],
-    })
+    # Reranker signature: rerank(expanded_query, hybrid_results, kg_results, top_k).
+    # expanded_query must carry the `intent` + `parsed` blocks — use the canonical
+    # intent dict directly. hybrid/kg inputs are the candidate lists (not the
+    # wrapping dicts), each item carrying `candidate_id` + `score`.
+    hybrid_cands = (payload["hybrid_raw"] or {}).get("candidates", [])
+    kg_cands     = (payload["kg_raw"]     or {}).get("candidates", [])
+    reranked = rerank_module(payload["intent"], hybrid_cands, kg_cands)
     payload["reranked"] = reranked
     payload["trace"]["rerank_ms"] = round((time.time() - t0) * 1000, 1)
     return payload
@@ -145,14 +146,23 @@ def _run_rerank(payload: dict[str, Any]) -> dict[str, Any]:
 # ─── Stage 5: explainability ─────────────────────────────────
 def _run_explain(payload: dict[str, Any]) -> dict[str, Any]:
     t0 = time.time()
-    explanations = explain_module({
-        "query": payload["query"],
-        "intent": payload["intent"],
-        "reranked": payload["reranked"],
-        "hybrid": payload["hybrid_raw"],
-        "kg": payload["kg_raw"],
-        "tagged_candidates": payload["tagged_candidates"],
-    })
+    try:
+        explanations = explain_module({
+            "query": payload["query"],
+            "intent": payload["intent"],
+            "reranked": payload["reranked"],
+            "hybrid": payload["hybrid_raw"],
+            "kg": payload["kg_raw"],
+            "tagged_candidates": payload["tagged_candidates"],
+        })
+    except NotImplementedError:
+        # Explainability is still a stub — don't block the rest of the pipeline.
+        explanations = {
+            "per_candidate": {},
+            "process_summary": "explainability module not implemented yet",
+            "intent_summary":  "",
+            "_stub": True,
+        }
     payload["explanations"] = explanations
     payload["trace"]["explain_ms"] = round((time.time() - t0) * 1000, 1)
     return payload

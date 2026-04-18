@@ -322,6 +322,26 @@ class Reranker:
 
 
 # ---------------------------------------------------------------------------
+# Module-level adapter — required by modules/reranker/__init__.py
+# which does: from .rerank import rerank
+# ---------------------------------------------------------------------------
+
+def rerank(
+    expanded_query: dict,
+    hybrid_results: list[dict],
+    kg_results: list[dict],
+    top_k: int = TOP_K_DEFAULT,
+) -> dict:
+    """
+    Module-level adapter so the pipeline can call rerank() directly without
+    instantiating Reranker explicitly.
+
+    Equivalent to: Reranker().rerank(expanded_query, hybrid_results, kg_results, top_k)
+    """
+    return Reranker().rerank(expanded_query, hybrid_results, kg_results, top_k)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 

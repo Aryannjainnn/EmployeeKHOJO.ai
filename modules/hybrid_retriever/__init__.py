@@ -51,8 +51,10 @@ def _flatten(raw: dict) -> dict:
     candidates: list[dict[str, Any]] = []
     for r in hybrid_block.get("results", []):
         scores = r.get("scores") or {}
+        cid = str(r.get("candidate_id")) if r.get("candidate_id") is not None else None
         candidates.append({
-            "id":    str(r.get("candidate_id")) if r.get("candidate_id") is not None else None,
+            "id":    cid,
+            "candidate_id": cid,   # preserve for downstream reranker contract
             "score": scores.get("primary"),
             "rank":              r.get("rank"),
             "name":              r.get("name"),
