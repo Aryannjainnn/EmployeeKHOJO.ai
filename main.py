@@ -5,7 +5,7 @@ Endpoints
 GET  /                  → static index.html (NexusSearch UI, loaded via Babel)
 GET  /search?q=...      → runs the orchestrator pipeline, returns frontend-shape
 POST /search  {query}   → same, JSON body
-POST /explain {row_data}→ stub explanation endpoint (returns canned summary)
+POST /explain {row_data}→ streams AI explanation via SSE (text/event-stream)
 GET  /health            → liveness probe
 """
 
@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from orchestrator import run as run_pipeline
@@ -55,9 +55,12 @@ def _to_frontend_shape(out: dict) -> dict:
                       keyword_highlights[{term}], skill_overlap,
                       transparency_notes, intent_alignment}
 
-    We carry two signals through the pipeline — hybrid (lexical+dense) and KG
-    (graph traversal). We map them onto the card's BM25/Semantic slots so the
-    existing UI renders without changes: BM25 ← hybrid signal, Semantic ← KG.
+    Score field mapping (reranker → frontend):
+        hybrid_score  → bm25_raw        (BM25 + dense hybrid signal)
+        kg_score      → semantic_cosine (Knowledge Graph graph score)
+        final_score   → hybrid_score    (fused final score, also rrf_score)
+        alpha         → score_breakdown.BM25      (hybrid weight fraction)
+        beta          → score_breakdown.Semantic   (KG weight fraction)
     """
     reranked   = out.get("reranked") or {}
     rr_results = reranked.get("results") or []
@@ -92,13 +95,18 @@ def _to_frontend_shape(out: dict) -> dict:
             or ""
         )
 
-        # -- score breakdown ------------------------------------------------
-        final   = float(r.get("final_score")  or 0.0)
-        h_score = float(r.get("hybrid_score") or 0.0)
-        k_score = float(r.get("kg_score")     or 0.0)
-        total   = (h_score + k_score) or 1.0
-        h_frac  = h_score / total
-        k_frac  = k_score / total
+        # -- score breakdown (reranker fields → frontend slots) -------------
+        final_score   = float(r.get("final_score")  or 0.0)
+        hybrid_score  = float(r.get("hybrid_score") or 0.0)   # BM25+dense RRF
+        kg_score      = float(r.get("kg_score")     or 0.0)   # KG graph score
+        alpha         = float(r.get("alpha")        or 0.5)   # hybrid weight
+        beta          = float(r.get("beta")         or 0.5)   # KG weight
+        modifier_delta = float(r.get("modifier_delta") or 0.0)
+
+        # score_breakdown percentages for the bar chart
+        # alpha/beta already sum to 1 from the reranker
+        bm25_pct     = round(alpha * 100)
+        semantic_pct = round(beta  * 100)
 
         # -- keyword chips --------------------------------------------------
         matched = _as_list(r.get("matched_terms") or k.get("matched_terms"))
@@ -110,7 +118,7 @@ def _to_frontend_shape(out: dict) -> dict:
             if any(qs and (qs in s.lower() or s.lower() in qs) for qs in q_skills)
         ]
 
-        # -- reasons → bullets ---------------------------------------------
+        # -- match_reasons → bullets (from KG) -----------------------------
         reasons = k.get("match_reasons") or []
         bullets = [
             f"Matched '{rr.get('query_term')}' → {rr.get('matched_node')} "
@@ -118,35 +126,51 @@ def _to_frontend_shape(out: dict) -> dict:
             for rr in reasons[:6]
             if rr.get("matched_node") is not None
         ]
-        alpha = r.get("alpha")
-        beta  = r.get("beta")
-        delta = r.get("modifier_delta")
-        if alpha is not None and beta is not None:
-            bullets.append(
-                f"Fusion: α={alpha:.2f}·hybrid + β={beta:.2f}·kg"
-                + (f"  (modifier Δ={delta:+.3f})" if delta else "")
-            )
+        # Add fusion info bullet
+        bullets.append(
+            f"Fusion: α={alpha:.2f}·hybrid + β={beta:.2f}·kg"
+            + (f"  (modifier Δ={modifier_delta:+.3f})" if modifier_delta else "")
+        )
 
         frontend_results.append({
-            "id":         cid,
-            "rank":       i,
-            "title":      title,
-            "industry":   "—",
-            "location":   "—",
-            "rrf_score":  final,
-            "preview":    (preview or "")[:500],
-            "skills":     skills[:10],
+            "id":        cid,
+            "rank":      i,
+            "title":     title,
+            "industry":  "—",
+            "location":  "—",
+            "rrf_score": final_score,          # final fused score
+            "source":    r.get("source", "both"),
+            "preview":   (preview or "")[:500],
+            "skills":    skills[:10],
             "explanation": {
-                "summary":
-                    f"{name}: final score {final:.3f} "
+                # Human-readable summary (used as fallback before LLM runs)
+                "summary": (
+                    f"{name}: final score {final_score:.3f} "
                     f"(source: {r.get('source')}). "
-                    + (f"{len(matched)} graph terms matched. " if matched else "")
-                    + (f"{len(overlap)} core-skill overlaps with query. " if overlap else ""),
-                "detail_bullets":     bullets,
-                "score_breakdown":    {"BM25": round(h_frac, 3), "Semantic": round(k_frac, 3)},
-                "bm25_raw":           round(h_score, 4),
-                "semantic_cosine":    round(k_score, 4),
-                "hybrid_score":       round(final, 4),
+                    + (f"{len(matched)} search terms matched via graph. " if matched else "")
+                    + (f"{len(overlap)} core-skill overlaps with query. " if overlap else "")
+                ),
+                "detail_bullets": bullets,
+
+                # score_breakdown drives the three progress bars in the UI
+                # BM25 slot  → hybrid retrieval weight  (alpha)
+                # Semantic slot → KG weight             (beta)
+                "score_breakdown": {
+                    "BM25":     round(alpha, 3),
+                    "Semantic": round(beta,  3),
+                },
+
+                # Raw score values shown in the Signal Analysis tab
+                # bm25_raw        ← hybrid_score  (BM25+dense signal)
+                # semantic_cosine ← kg_score       (knowledge-graph score)
+                # hybrid_score    ← final_score    (fused output)
+                "bm25_raw":        round(hybrid_score, 4),
+                "semantic_cosine": round(kg_score,     4),
+                "hybrid_score":    round(final_score,  4),
+
+                # modifier delta (experience match bonus / negation penalty)
+                "modifier_delta":  round(modifier_delta, 4),
+
                 "keyword_highlights": kw_highlights,
                 "skill_overlap":      overlap[:8],
                 "transparency_notes": (
@@ -154,18 +178,19 @@ def _to_frontend_shape(out: dict) -> dict:
                 ) + (
                     [kg_raw["_error"]] if kg_raw.get("_error") else []
                 ),
-                "intent_alignment":
+                "intent_alignment": (
                     f"Intent: {intent_block.get('primary_intent', 'unknown')} "
                     f"(confidence {intent_block.get('confidence', 0):.2f}). "
-                    f"Retrieved via: {r.get('source')}.",
+                    f"Retrieved via: {r.get('source')}."
+                ),
             },
         })
 
     trace = out.get("trace") or {}
 
     return {
-        "results":           frontend_results,
-        "intent":            {
+        "results":          frontend_results,
+        "intent": {
             "primary":    intent_block.get("primary_intent", "unknown"),
             "confidence": intent_block.get("confidence"),
             "modifiers":  intent_block.get("modifiers", []),
@@ -210,19 +235,52 @@ def search_post(req: SearchRequest) -> JSONResponse:
 
 
 @app.post("/explain")
-def explain_endpoint(payload: dict = Body(...)) -> JSONResponse:
-    """Stub: returns the canned summary already baked into the row.
+async def explain_endpoint(payload: dict = Body(...)) -> StreamingResponse:
+    """
+    Stream an AI explanation for a single candidate card.
 
-    Swap this with an LLM call when the explainability module is ready.
+    The frontend sends the full row_data object (the card's data).
+    We stream back SSE chunks so the text appears word-by-word.
+
+    SSE format:
+        data: <text chunk>\\n\\n
+        data: [DONE]\\n\\n
     """
     row = (payload or {}).get("row_data") or {}
-    expl = row.get("explanation") or {}
-    text = (
-        expl.get("summary")
-        or expl.get("intent_alignment")
-        or "No explanation available for this candidate."
+
+    async def _generate():
+        try:
+            from modules.explainability.explain import explain_stream
+            import asyncio
+
+            # explain_stream is a sync generator — run it in a thread pool
+            loop = asyncio.get_event_loop()
+
+            def _sync_gen():
+                return list(explain_stream(row))
+
+            chunks = await loop.run_in_executor(None, _sync_gen)
+            for chunk in chunks:
+                # SSE format
+                safe = chunk.replace("\n", " ")
+                yield f"data: {safe}\n\n"
+
+        except Exception as exc:
+            # Send the fallback explanation as a single chunk
+            from modules.explainability.explain import _fallback_explanation
+            text = _fallback_explanation(row)
+            yield f"data: {text}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
-    return JSONResponse(content={"explanation": text})
 
 
 @app.get("/health")
