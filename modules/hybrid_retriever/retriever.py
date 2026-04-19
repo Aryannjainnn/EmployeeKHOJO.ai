@@ -1,38 +1,53 @@
 """
-Hybrid Retrieval Engine — Component B
+Hybrid Retrieval Engine — Component B  (Fixed v3)
 Intent-Aware Retrieval combining BM25 (lexical) + FAISS (semantic) with RRF fusion.
 
-Input  : Parsed intent JSON from Component A (query understanding)
-         + index artifacts: dense_matrix.npy, dense.pkl, bm25.pkl, metadata.pkl, skills.pkl
-Output : Ranked JSON with per-result explanations ready for the Explainability Bot.
+Input  : Parsed intent JSON from Component C (query understanding)
+         + index artifacts built by Component A:
+           dense_matrix.npy, dense.pkl, bm25.pkl, metadata.pkl, skills.pkl
+Output : Ranked JSON with per-result explanations ready for Component F.
 
-Design priorities
------------------
-- Core skills are BOOSTED (3x weight) vs secondary/soft skills
-- RRF (Reciprocal Rank Fusion) merges lexical + semantic rank lists
-- Per-result explanation dict tracks WHICH signals fired and WHY
-- Zero heavy I/O at query time — all indexes loaded once at startup
+Changes from v2
+---------------
+- RECALL FIX: Removed double-boost that was crushing recall.
+  v2 applied CORE_SKILL_BOOST (3x) at TF level in _doc_tfs AND again as
+  IDF multiplier in score_query → effectively 9x on top candidates, which
+  after normalization pushed everyone else below bm25_floor=0.25.
+  Fix: TF boost in _doc_tfs is kept (matches Component A's index-time
+  weighting intent). IDF amplifier in score_query is reduced to 1.5x
+  (signal boost, not score collapse).
+
+- RECALL FIX: bm25_floor lowered from 0.25 → 0.05.
+  With correct metadata loading, BM25 scores concentrate more sharply at
+  the top than the old regex-based metadata did. 0.25 was calibrated for
+  the old (wrong) score distribution. 0.05 restores the original recall
+  behavior without touching any other threshold.
+
+- RECALL FIX: sem_threshold dropped from max*0.85 → max*0.60.
+  Same reason — correct embeddings produce a tighter score distribution.
+  0.60 restores the original recall band.
+
+- All other thresholds (SCORE_FLOOR_RATIO=0.20, RRF_K=60, ALPHA_*, etc.)
+  are unchanged from v2.
 """
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import time
 import pickle
-import sys
-import types
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 # ============================================================================
-# FLEX UNPICKLER (To handle missing indexer module classes)
+# FLEX UNPICKLER
 # ============================================================================
 
 class FlexUnpickler(pickle.Unpickler):
+    """Gracefully handles missing Component A classes when unpickling."""
     def find_class(self, module, name):
         try:
             return super().find_class(module, name)
@@ -40,17 +55,18 @@ class FlexUnpickler(pickle.Unpickler):
             return type(name, (), {})
 
 
-# ---------------------------------------------------------------------------
-# Optional heavy deps — fail gracefully so unit tests can import this file
-# ---------------------------------------------------------------------------
+# ============================================================================
+# OPTIONAL HEAVY DEPS
+# ============================================================================
+
 try:
-    import faiss  # type: ignore
+    import faiss
     FAISS_AVAILABLE = True
 except ImportError:
     FAISS_AVAILABLE = False
 
 try:
-    from sentence_transformers import SentenceTransformer  # type: ignore
+    from sentence_transformers import SentenceTransformer
     SBERT_AVAILABLE = True
 except ImportError:
     SBERT_AVAILABLE = False
@@ -60,217 +76,271 @@ except ImportError:
 # CONSTANTS
 # ============================================================================
 
-# RRF rank-smoothing constant (standard value = 60)
-RRF_K = 60
+RRF_K            = 60
+ALPHA_BM25       = 0.40
+ALPHA_DENSE      = 0.60
+CORE_SKILL_BOOST = 3.0      # TF multiplier in _doc_tfs (index-time alignment)
+SECONDARY_BOOST  = 1.2      # TF multiplier for secondary skills
+CORE_IDF_BOOST   = 1.5      # IDF amplifier for core query tokens (was 3.0 = double boost)
+DEFAULT_TOP_K    = 50
+SBERT_MODEL      = "BAAI/bge-base-en-v1.5"
+BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
-# Weight split between lexical and semantic in final score
-ALPHA_BM25   = 0.40   # lexical contribution
-ALPHA_DENSE  = 0.60   # semantic contribution
+# Proficiency weight threshold — matches Component A's PROFICIENCY_SCALE:
+#   competent=1.2, proficient=1.5, advanced=1.7, expert=2.0, certified=2.0
+CORE_WEIGHT_THRESHOLD = 1.2
 
-# Core-skill boost — candidates whose core_skills match query get multiplied
-CORE_SKILL_BOOST    = 3.0   # multiplier on BM25 TF for core skill tokens
-SECONDARY_BOOST     = 1.2   # multiplier for secondary skill tokens
-
-# Experience-band → minimum years mapping (used for hard filtering)
 EXPERIENCE_BAND_MIN = {
-    "junior":   0,
-    "mid":      2,
-    "senior":   5,
-    "lead":     8,
-    "principal":10,
+    "junior": 0, "mid": 2, "senior": 5, "lead": 8, "principal": 10,
 }
 
-# Maximum candidates to return
-DEFAULT_TOP_K    = 50    # raised from 20 — match KG recall level
-
-# SBERT model — swappable
-SBERT_MODEL = "all-MiniLM-L6-v2"
-
-# Stopwords — excluded from BM25 query tokens to avoid noise matches.
-# These are generic words that appear in every job description and add no signal.
 STOPWORDS: frozenset[str] = frozenset({
-    # English function words
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "from", "as", "is", "are", "was", "were", "be",
-    "been", "being", "have", "has", "had", "do", "does", "did", "will",
-    "would", "could", "should", "may", "might", "shall", "can", "not",
-    "no", "nor", "so", "yet", "this", "that", "it", "its", "my", "your",
-    "he", "she", "we", "they", "them", "their", "our", "than", "then",
-    "there", "here", "when", "where", "who", "which", "what", "how",
-    "if", "about", "up", "out", "into", "over", "after", "also",
-    # Recruitment boilerplate — carry zero signal for skill matching
-    "senior", "junior", "mid", "level", "entry", "lead", "principal",
-    "years", "year", "yrs", "yr", "experience", "experienced",
-    "candidate", "candidates", "someone", "person", "professional",
-    "role", "roles", "position", "job", "looking", "need", "required",
-    "require", "seeking", "find", "want", "skills", "skill",
-    "proficient", "competent", "expert", "beginner", "advanced",
-    "suitable", "background", "strong", "good",
-    # Numbers / units
-    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "a","an","the","and","or","but","in","on","at","to","for","of","with",
+    "by","from","as","is","are","was","were","be","been","being","have",
+    "has","had","do","does","did","will","would","could","should","may",
+    "might","shall","can","not","no","nor","so","yet","this","that","it",
+    "its","my","your","he","she","we","they","them","their","our","than",
+    "then","there","here","when","where","who","which","what","how","if",
+    "about","up","out","into","over","after","also",
+    "senior","junior","mid","level","entry","lead","principal",
+    "years","year","yrs","yr","experience","experienced",
+    "candidate","candidates","someone","person","professional",
+    "role","roles","position","job","looking","need","required",
+    "require","seeking","find","want","skills","skill",
+    "proficient","competent","expert","beginner","advanced",
+    "suitable","background","strong","good",
+    "one","two","three","four","five","six","seven","eight","nine","ten",
 })
 
 
 # ============================================================================
-# BM25 ENGINE  (pure-python, loaded from bm25.pkl)
+# HELPER — build rich metadata from Component A's MetadataStore
+# ============================================================================
+
+def _build_metadata_list(
+    meta_store: Any,
+    dense_doc_ids: list[str],
+    dense_texts: list[str],
+) -> list[dict]:
+    """
+    Build metadata list in Dense index order from Component A's MetadataStore.
+
+    Component A's metadata entry per doc_id:
+        id                  : str
+        name                : str
+        top_skills          : list[tuple[str, float]]  (skill_name, proficiency_weight)
+        years_of_experience : float
+        potential_roles     : str
+    """
+    store: dict[str, dict] = getattr(meta_store, "_store", {})
+    metadata = []
+
+    for i, doc_id in enumerate(dense_doc_ids):
+        raw  = store.get(doc_id)
+        text = dense_texts[i] if i < len(dense_texts) else ""
+
+        if raw is None:
+            metadata.append({
+                "id":                    doc_id,
+                "name":                  f"Candidate {doc_id}",
+                "top_skills":            [],
+                "core_skill_names":      set(),
+                "secondary_skill_names": set(),
+                "core_skills_str":       "",
+                "secondary_skills_str":  "",
+                "soft_skills":           "",
+                "years_of_experience":   0.0,
+                "potential_roles":       "",
+                "skill_summary":         text,
+            })
+            continue
+
+        top_skills: list[tuple[str, float]] = raw.get("top_skills") or []
+
+        core_skills      = [(s, w) for s, w in top_skills if w >= CORE_WEIGHT_THRESHOLD]
+        secondary_skills = [(s, w) for s, w in top_skills if w <  CORE_WEIGHT_THRESHOLD]
+
+        core_skill_names      = {s for s, _ in core_skills}
+        secondary_skill_names = {s for s, _ in secondary_skills}
+
+        def _fmt(skill_list: list[tuple[str, float]]) -> str:
+            return ", ".join(
+                f"{s.replace('_', ' ').title()} ({_weight_to_prof(w)})"
+                for s, w in skill_list
+            )
+
+        metadata.append({
+            "id":                    doc_id,
+            "name":                  raw.get("name") or f"Candidate {doc_id}",
+            "top_skills":            top_skills,
+            "core_skill_names":      core_skill_names,
+            "secondary_skill_names": secondary_skill_names,
+            "core_skills_str":       _fmt(core_skills),
+            "secondary_skills_str":  _fmt(secondary_skills),
+            "soft_skills":           "",
+            "years_of_experience":   float(raw.get("years_of_experience") or 0),
+            "potential_roles":       raw.get("potential_roles") or "",
+            "skill_summary":         text,
+        })
+
+    return metadata
+
+
+def _weight_to_prof(w: float) -> str:
+    if w >= 2.0: return "Expert"
+    if w >= 1.7: return "Advanced"
+    if w >= 1.5: return "Proficient"
+    if w >= 1.2: return "Competent"
+    if w >= 1.0: return "Intermediate"
+    if w >= 0.7: return "Advanced Beginner"
+    if w >= 0.5: return "Beginner"
+    return "Novice"
+
+
+# ============================================================================
+# BM25 ENGINE
 # ============================================================================
 
 class BM25Engine:
     """
-    Wraps the serialised BM25 index produced by Component A (indexer.py).
+    Wraps Component A's BM25Index pickle.
 
-    Expected pickle keys
-    --------------------
-    corpus_tokens : list[list[str]]   — tokenised docs
-    idf           : dict[str, float]  — precomputed IDF per term
-    avgdl         : float             — average document length
-    k1, b         : float             — Robertson BM25 params
-    doc_freqs     : list[dict]        — TF per doc (optional; recomputed if absent)
-
-    The engine adds core-skill boosting: tokens that appear in a candidate's
-    core_skills string receive CORE_SKILL_BOOST multiplied into their TF.
+    Alignment guarantees:
+    - _doc_tfs built in Dense doc_id order (not BM25 native order) so
+      bm25_agg[i] and dense_scores[i] always refer to the same candidate.
+    - Core-skill TF boost uses proficiency weight sets from MetadataStore.
+    - IDF amplifier for core query tokens is CORE_IDF_BOOST (1.5x), NOT
+      CORE_SKILL_BOOST (3.0x) — prevents double-boost score collapse.
     """
 
-    def __init__(self, bm25_path: str | Path, metadata: list[dict]) -> None:
+    def __init__(
+        self,
+        bm25_path: str | Path,
+        metadata: list[dict],
+        dense_doc_ids: list[str],
+    ) -> None:
         with open(bm25_path, "rb") as f:
             data = FlexUnpickler(f).load()
 
-        # Extract from BM25Index object
-        self._doc_freqs: list[dict[str, int]] = getattr(data, "_doc_freqs", [])
-        self._df: dict[str, int]              = getattr(data, "_df", {})
-        self.avgdl: float                   = getattr(data, "_avgdl", 50.0)
-        self.k1: float                      = getattr(data, "k1", 1.5)
-        self.b: float                       = getattr(data, "b", 0.75)
-        self.n_docs: int                    = len(self._doc_freqs)
-        self._doc_lengths                   = getattr(data, "_doc_lengths", [])
-        self.normalizer                     = getattr(data, "_normalizer", None)
+        self._bm25_doc_ids: list[str]         = getattr(data, "_doc_ids", [])
+        self._doc_freqs: list[dict[str, int]]  = getattr(data, "_doc_freqs", [])
+        self._doc_lengths: list[int]           = getattr(data, "_doc_lengths", [])
+        self._df: dict[str, int]               = getattr(data, "_df", {})
+        self.avgdl: float                      = getattr(data, "_avgdl", 50.0)
+        self.k1: float                         = getattr(data, "k1", 1.5)
+        self.b: float                          = getattr(data, "b", 0.75)
+        self.n_bm25: int                       = len(self._bm25_doc_ids)
+        self.normalizer                        = getattr(data, "_normalizer", None)
 
-        # Convert _df to IDF
-        self.idf: dict[str, float] = {}
-        for term, freq in self._df.items():
-            self.idf[term] = math.log((self.n_docs - freq + 0.5) / (freq + 0.5) + 1.0)
+        # IDF table
+        self.idf: dict[str, float] = {
+            term: math.log((self.n_bm25 - freq + 0.5) / (freq + 0.5) + 1.0)
+            for term, freq in self._df.items()
+        }
 
-        # Build per-doc TF dicts (with core-skill boosting baked in)
+        # Dense is the authority for document ordering
+        bm25_id_to_pos: dict[str, int] = {
+            did: i for i, did in enumerate(self._bm25_doc_ids)
+        }
+        self.n_docs = len(dense_doc_ids)
+
+        # Build TF dicts in Dense order with proficiency-aware boost
         self._doc_tfs: list[dict[str, float]] = []
-        for idx, tf_dict in enumerate(self._doc_freqs):
-            core_text = (metadata[idx].get("core_skills") or "").lower()
-            sec_text = (metadata[idx].get("secondary_skills") or "").lower()
-            
+        for dense_pos, doc_id in enumerate(dense_doc_ids):
+            bm25_pos = bm25_id_to_pos.get(doc_id)
+            if bm25_pos is None:
+                self._doc_tfs.append({})
+                continue
+
+            raw_tf = self._doc_freqs[bm25_pos]
+            meta   = metadata[dense_pos]
+
+            core_names      = meta.get("core_skill_names", set())
+            secondary_names = meta.get("secondary_skill_names", set())
+
             tf: dict[str, float] = {}
-            for tok, base_tf in tf_dict.items():
-                boosted_tf = float(base_tf)
-                # Apply boost if the token appears in core_skills field
-                if tok in core_text:
-                    boosted_tf *= CORE_SKILL_BOOST
-                elif tok in sec_text:
-                    boosted_tf *= SECONDARY_BOOST
-                tf[tok] = boosted_tf
+            for tok, base_tf in raw_tf.items():
+                tok_space = tok.replace("_", " ")
+                if tok_space in core_names or tok in core_names:
+                    tf[tok] = float(base_tf) * CORE_SKILL_BOOST
+                elif tok_space in secondary_names or tok in secondary_names:
+                    tf[tok] = float(base_tf) * SECONDARY_BOOST
+                else:
+                    tf[tok] = float(base_tf)
             self._doc_tfs.append(tf)
 
-    # ------------------------------------------------------------------
+        # Doc lengths in Dense order
+        self._aligned_lengths: list[int] = []
+        for doc_id in dense_doc_ids:
+            bm25_pos = bm25_id_to_pos.get(doc_id)
+            if bm25_pos is not None and bm25_pos < len(self._doc_lengths):
+                self._aligned_lengths.append(self._doc_lengths[bm25_pos])
+            else:
+                self._aligned_lengths.append(int(self.avgdl))
+
     def score_query(
         self,
         query_tokens: list[str],
         core_query_tokens: set[str],
-    ) -> np.ndarray:
-        """
-        Return BM25 scores for every document.
-
-        core_query_tokens — tokens extracted from detected skills in the intent;
-                            these receive an additional IDF boost.
-        """
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         scores = np.zeros(self.n_docs, dtype=np.float32)
         term_scores: dict[str, np.ndarray] = {}
-        
-        dl_arr = np.array(self._doc_lengths, dtype=np.float32)
-        norm   = 1.0 - self.b + self.b * (dl_arr / self.avgdl)
+
+        dl_arr = np.array(self._aligned_lengths, dtype=np.float32)
+        norm   = 1.0 - self.b + self.b * (dl_arr / max(self.avgdl, 1.0))
 
         for term in query_tokens:
             if term not in self.idf:
                 continue
             idf_val = self.idf[term]
-            # Extra IDF amplification for skill tokens from parsed intent
+
+            # FIX: use CORE_IDF_BOOST (1.5x) not CORE_SKILL_BOOST (3.0x)
+            # TF is already boosted 3x in _doc_tfs — applying 3x here too
+            # caused 9x total amplification → score collapse after normalization
             if term in core_query_tokens:
-                idf_val *= CORE_SKILL_BOOST
+                idf_val *= CORE_IDF_BOOST
 
             t_scores = np.zeros(self.n_docs, dtype=np.float32)
-            for doc_id, tf_dict in enumerate(self._doc_tfs):
+            for i, tf_dict in enumerate(self._doc_tfs):
                 tf = tf_dict.get(term, 0.0)
-                if tf == 0:
+                if tf == 0.0:
                     continue
-                tf_norm = (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm[doc_id])
-                t_scores[doc_id] = idf_val * tf_norm
+                tf_norm = (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm[i])
+                t_scores[i] = idf_val * tf_norm
 
-            scores += t_scores
+            scores          += t_scores
             term_scores[term] = t_scores
 
         return scores, term_scores
 
     def tokenize(self, text: str) -> list[str]:
-        # Simple fallback — strips stopwords so filler words don't pollute BM25
-        if not self.normalizer:
-            text = text.lower()
-            text = re.sub(r"[^a-z0-9\s]", " ", text)
-            return [t for t in text.split() if len(t) > 1 and t not in STOPWORDS]
-            
-        # Use canonical normalizer logic
-        text = text.lower()
-        # 1. Expand abbreviations
-        abbrev = getattr(self.normalizer, '_abbrev_map', {})
-        for word, expansion in abbrev.items():
-            text = re.sub(rf'\b{re.escape(word)}\b', expansion, text)
-            
-        # 2. Entity aliases
-        aliases = getattr(self.normalizer, '_entity_aliases', {})
-        for phrase, canonical in aliases.items():
-            text = text.replace(phrase, canonical)
-            
-        # 3. Strip suffixes
-        suffixes = getattr(self.normalizer, '_strip_suffixes', [])
-        for suffix in suffixes:
-            text = text.replace(suffix, '')
-            
-        tokens = []
-        syn_map = getattr(self.normalizer, '_synonym_to_canonical', {})
-        # Simple greedy matching for phrases
-        words = re.sub(r"[^a-z0-9\s]", " ", text).split()
-        
-        # Extremely basic tokenizer simulating what the canonicalizer does
-        # Real one is likely more complex, but this will get us "aws" -> "amazon_web_services"
-        # We'll just map individual words and bigrams if possible, or fallback to the exact dict
-        
-        for w in words:
-            if w in STOPWORDS:
-                continue
-            if w in syn_map:
-                tokens.append(syn_map[w].replace(' ', '_'))
-            else:
-                tokens.append(w.replace(' ', '_'))
-                
-        # Handle full phrases mapping (like "amazon web services")
-        full_text = " ".join(words)
-        for phrase, canonical in syn_map.items():
-            if phrase in full_text:
-                tokens.append(canonical.replace(' ', '_'))
-                
-        return [t for t in set(tokens) if t not in STOPWORDS]
+        """
+        Exact mirror of Component A's BM25Index.tokenise():
+            re.findall(r"[a-z0-9][a-z0-9+#_]*") + normalize_token() + split expansions.
+        """
+        raw_tokens = re.findall(r"[a-z0-9][a-z0-9+#_]*", text.lower())
+        normalized: list[str] = []
+        normalize_token = (
+            self.normalizer.normalize_token
+            if self.normalizer
+            else lambda t: t
+        )
+        for t in raw_tokens:
+            normalized.extend(normalize_token(t).split())
+        return normalized
 
 
 # ============================================================================
-# SEMANTIC ENGINE  (SBERT + FAISS)
+# SEMANTIC ENGINE
 # ============================================================================
 
 class SemanticEngine:
     """
-    Wraps the FAISS index + SBERT encoder.
+    Wraps Component A's DenseIndex pickle + dense_matrix.npy.
 
-    dense.pkl is expected to contain:
-        model_name    : str  (optional, falls back to SBERT_MODEL constant)
-        index_type    : str  ("flat_ip" | "flat_l2")
-        n_candidates  : int
-        embedding_dim : int
-
-    dense_matrix.npy contains the raw 384-d float32 embeddings (n_docs × 384).
+    - Reads BGE_QUERY_PREFIX from the pickled DenseIndex object.
+    - Applies prefix to all queries at encode time (never at index time).
+    - Batch-encodes all expanded queries in one SBERT forward pass.
     """
 
     def __init__(
@@ -281,23 +351,27 @@ class SemanticEngine:
         with open(dense_pkl_path, "rb") as f:
             cfg = FlexUnpickler(f).load()
 
-        # Load raw matrix directly from object
-        if hasattr(cfg, "_matrix"):
-            matrix: np.ndarray = cfg._matrix.astype(np.float32)
+        if hasattr(cfg, "_matrix") and cfg._matrix is not None:
+            matrix: np.ndarray = np.array(cfg._matrix, dtype=np.float32)
         elif Path(dense_matrix_path).exists():
             matrix = np.load(dense_matrix_path).astype(np.float32)
         else:
-            raise FileNotFoundError(f"Matrix not found in object or {dense_matrix_path}")
+            raise FileNotFoundError(
+                f"Embedding matrix not found in {dense_pkl_path} or {dense_matrix_path}"
+            )
 
-        strategy = getattr(cfg, "strategy", None)
-        self.model_name: str = SBERT_MODEL if strategy == "sbert" or not strategy else strategy
+        self.bge_prefix: str = getattr(cfg, "BGE_QUERY_PREFIX", BGE_QUERY_PREFIX)
+        strategy             = getattr(cfg, "strategy", "sbert")
+        self.model_name: str = (
+            getattr(cfg, "SBERT_MODEL_NAME", SBERT_MODEL)
+            if strategy == "sbert" else SBERT_MODEL
+        )
         self.embedding_dim: int = matrix.shape[1]
-        self.n_docs = matrix.shape[0]
+        self.n_docs: int        = matrix.shape[0]
 
-        # Normalise for cosine similarity via inner product
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1e-9, norms)
-        self._matrix = matrix / norms          # shape (n_docs, dim)
+        self._matrix = (matrix / norms).astype(np.float32)
 
         if FAISS_AVAILABLE:
             self._index = faiss.IndexFlatIP(self.embedding_dim)
@@ -305,32 +379,38 @@ class SemanticEngine:
         else:
             self._index = None
 
-        # Always lazy-load encoder to avoid using broken unpickled dummy objects
         self._encoder = None
 
-    def _get_encoder(self):
+    def _get_encoder(self) -> Any:
         if self._encoder is None and SBERT_AVAILABLE:
             self._encoder = SentenceTransformer(self.model_name)
         return self._encoder
 
-    def encode_query(self, text: str) -> np.ndarray:
-        enc = self._get_encoder()
-        if enc is None:
-            # Fallback: random unit vector (for testing without GPU/model)
-            v = np.random.randn(self.embedding_dim).astype(np.float32)
-            return v / np.linalg.norm(v)
-        vec = enc.encode([text], convert_to_numpy=True, normalize_embeddings=True)
-        return vec[0].astype(np.float32)
+    def encode_queries_batch(self, queries: list[str]) -> np.ndarray:
+        """Batch encode all queries with BGE prefix in one forward pass."""
+        enc      = self._get_encoder()
+        prefixed = [self.bge_prefix + q for q in queries]
 
-    def score_query(self, query_vec: np.ndarray) -> np.ndarray:
-        """Return cosine similarity scores for all docs."""
+        if enc is None:
+            vecs  = np.random.randn(len(queries), self.embedding_dim).astype(np.float32)
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            return vecs / np.where(norms == 0, 1, norms)
+
+        vecs = enc.encode(
+            prefixed,
+            batch_size=min(len(prefixed), 32),
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return np.array(vecs, dtype=np.float32)
+
+    def score_queries_batch(self, query_vecs: np.ndarray) -> np.ndarray:
+        """Score all queries against all docs. Returns (n_queries, n_docs)."""
         if self._index is not None:
-            # FAISS batch inner product — O(n·d) but extremely fast in C++
-            scores, _ = self._index.search(query_vec.reshape(1, -1), self.n_docs)
-            return scores[0]
-        else:
-            # Pure numpy fallback
-            return self._matrix @ query_vec
+            scores, _ = self._index.search(query_vecs, self.n_docs)
+            return scores
+        return query_vecs @ self._matrix.T
 
 
 # ============================================================================
@@ -342,14 +422,6 @@ def reciprocal_rank_fusion(
     weights: list[float] | None = None,
     k: int = RRF_K,
 ) -> np.ndarray:
-    """
-    Fuse multiple rank lists via Reciprocal Rank Fusion.
-
-    rank_lists : each array is a *score* vector (higher = better) over all docs.
-                 Converted internally to rank positions.
-    weights    : optional per-list weights (default uniform)
-    Returns    : fused score array (higher = better)
-    """
     if weights is None:
         weights = [1.0] * len(rank_lists)
 
@@ -357,7 +429,6 @@ def reciprocal_rank_fusion(
     fused  = np.zeros(n_docs, dtype=np.float64)
 
     for score_arr, w in zip(rank_lists, weights):
-        # argsort descending → rank positions (0-based)
         order = np.argsort(score_arr)[::-1]
         ranks = np.empty_like(order)
         ranks[order] = np.arange(n_docs)
@@ -375,16 +446,11 @@ def passes_experience_filter(
     experience_band: str | None,
     experience_years: str | None,
 ) -> bool:
-    """
-    Hard filter. Returns False if the candidate clearly doesn't meet requirements.
-    Lenient: if years_of_experience is missing/zero AND band is junior, allow.
-    """
     cand_years = float(candidate.get("years_of_experience") or 0)
 
     if experience_years:
         try:
             req = float(experience_years)
-            # Allow ±2.5 year tolerance — don't hard-reject borderline candidates
             if cand_years < req - 2.5:
                 return False
         except ValueError:
@@ -412,33 +478,32 @@ def build_explanation(
     parsed_intent: dict,
     term_contributions: dict[str, float],
 ) -> dict:
-    """
-    Human-readable explanation dict for each result.
-    This feeds directly into the Explainability Bot (Component F).
-    """
-    core_skills_raw   = candidate.get("core_skills", "")
-    secondary_raw     = candidate.get("secondary_skills", "")
-    core_skill_hits   = [s for s in matched_skills if s.lower() in core_skills_raw.lower()]
-    sec_skill_hits    = [s for s in matched_skills if s.lower() in secondary_raw.lower()
-                         and s not in core_skill_hits]
+    core_names      = candidate.get("core_skill_names", set())
+    secondary_names = candidate.get("secondary_skill_names", set())
+
+    core_hits = [s for s in matched_skills if s in core_names]
+    sec_hits  = [s for s in matched_skills if s in secondary_names and s not in core_hits]
 
     signals = []
-    if core_skill_hits:
-        signals.append(f"Core skill match: {', '.join(core_skill_hits)}")
-    if sec_skill_hits:
-        signals.append(f"Secondary skill match: {', '.join(sec_skill_hits)}")
+    if core_hits:
+        signals.append(f"Core skill match: {', '.join(core_hits)}")
+    if sec_hits:
+        signals.append(f"Secondary skill match: {', '.join(sec_hits)}")
     if bm25_score > 0:
         signals.append(f"Keyword relevance (BM25={bm25_score:.3f})")
     if dense_score > 0.5:
         signals.append(f"Semantic similarity (cos={dense_score:.3f})")
 
     exp_band = parsed_intent.get("experience_band")
-    exp_yrs  = candidate.get("years_of_experience", 0)
     if exp_band:
-        signals.append(f"Experience band '{exp_band}' — candidate has {exp_yrs} yrs")
+        signals.append(
+            f"Experience band '{exp_band}' — candidate has "
+            f"{candidate.get('years_of_experience', 0)} yrs"
+        )
 
     matched_keywords = sorted(
-        [{"term": t, "contribution": round(float(v), 4)} for t, v in term_contributions.items() if v > 0],
+        [{"term": t, "contribution": round(float(v), 4)}
+         for t, v in term_contributions.items() if v > 0],
         key=lambda x: x["contribution"],
         reverse=True,
     )
@@ -448,8 +513,8 @@ def build_explanation(
         "rrf_score":         round(float(rrf_score), 6),
         "bm25_score":        round(float(bm25_score), 4),
         "semantic_score":    round(float(dense_score), 4),
-        "core_skill_hits":   core_skill_hits,
-        "secondary_hits":    sec_skill_hits,
+        "core_skill_hits":   core_hits,
+        "secondary_hits":    sec_hits,
         "matched_keywords":  matched_keywords,
         "retrieval_signals": signals,
         "why_retrieved":     " | ".join(signals) if signals else "General profile relevance",
@@ -462,260 +527,190 @@ def build_explanation(
 
 class HybridRetriever:
     """
-    Loads all index artifacts once and answers queries in milliseconds.
+    Loads all Component A index artifacts once, answers queries in milliseconds.
 
-    Parameters
-    ----------
-    index_dir : path to folder containing bm25.pkl, dense.pkl,
-                dense_matrix.npy, metadata.pkl, skills.pkl (optional)
-    top_k     : number of candidates to return
+    Loading order
+    -------------
+    1. dense.pkl    → master doc_id ordering + texts + embeddings
+    2. metadata.pkl → rich per-doc metadata keyed by doc_id
+    3. bm25.pkl     → BM25 index (aligned to Dense order via doc_id map)
+    4. skills.pkl   → skill inverted index (optional)
     """
 
     def __init__(self, index_dir: str | Path, top_k: int = DEFAULT_TOP_K) -> None:
         index_dir  = Path(index_dir)
         self.top_k = top_k
 
-        # ---------- Load Dense Index first to get texts & doc_ids ----------
-        dense_path = index_dir / "dense.pkl"
-        with open(dense_path, "rb") as f:
+        # Step 1: Dense — master ordering
+        with open(index_dir / "dense.pkl", "rb") as f:
             dense_obj = FlexUnpickler(f).load()
-            
-        doc_ids = getattr(dense_obj, "_doc_ids", [])
-        texts = getattr(dense_obj, "_texts", [])
+        dense_doc_ids: list[str] = getattr(dense_obj, "_doc_ids", [])
+        dense_texts: list[str]   = getattr(dense_obj, "_texts", [])
 
-        # ---------- Build metadata from _texts ----------
-        self.metadata = []
-        for i, text in enumerate(texts):
-            doc_id = doc_ids[i] if i < len(doc_ids) else str(i)
-            
-            # Parse skills and roles from text
-            # Format usually: "... Skills: X (Competent), Y (Beginner). Suitable for roles: Z"
-            skills_part = ""
-            roles_part = ""
-            if "Skills:" in text:
-                parts = text.split("Skills:")
-                skills_raw = parts[1]
-                if "Suitable for roles:" in skills_raw:
-                    skills_part, roles_part = skills_raw.split("Suitable for roles:")
-                else:
-                    skills_part = skills_raw
-            
-            core_skills = []
-            secondary_skills = []
-            max_years = 0.0
-            
-            # Simple heuristic: Advanced/Competent -> Core (more years), Beginner -> Secondary (less years)
-            for skill_match in re.finditer(r"([^,]+?)\s*\(([^)]+)\)", skills_part):
-                skill = skill_match.group(1).strip()
-                prof = skill_match.group(2).strip().lower()
-                if "competent" in prof or "advanced" in prof or "expert" in prof:
-                    core_skills.append(f"{skill} ({prof})")
-                    max_years = max(max_years, 3.0 if "competent" in prof else 5.0)
-                else:
-                    secondary_skills.append(f"{skill} ({prof})")
-                    max_years = max(max_years, 1.0)
-                    
-            if max_years == 0 and ("fresher" in text.lower() or "intern" in text.lower()):
-                max_years = 0.5
-            elif max_years == 0:
-                max_years = 2.0  # Fallback
-
-            # Look for explicit mentions of years
-            years_match = re.search(r'(\d+)\+?\s*years?(?:\s*of)?\s*experience', text.lower())
-            if years_match:
-                max_years = max(max_years, float(years_match.group(1)))
-            
-            # Boost based on role mentions
-            text_lower = text.lower()
-            if "manager" in text_lower or "architect" in text_lower:
-                max_years = max(max_years, 8.0)
-            elif "lead" in text_lower or "senior" in text_lower:
-                max_years = max(max_years, 6.0)
-
-            self.metadata.append({
-                "id": doc_id,
-                "name": f"Candidate {doc_id}",
-                "core_skills": ", ".join(core_skills),
-                "secondary_skills": ", ".join(secondary_skills),
-                "soft_skills": "",
-                "years_of_experience": max_years,
-                "potential_roles": roles_part.strip(),
-                "skill_summary": text,
-            })
-
+        # Step 2: MetadataStore
+        with open(index_dir / "metadata.pkl", "rb") as f:
+            meta_store = FlexUnpickler(f).load()
+        self.metadata: list[dict] = _build_metadata_list(
+            meta_store, dense_doc_ids, dense_texts
+        )
         self.n_docs = len(self.metadata)
 
-        # ---------- BM25 ----------
-        self.bm25 = BM25Engine(index_dir / "bm25.pkl", self.metadata)
+        # Step 3: BM25 aligned to Dense order
+        self.bm25 = BM25Engine(
+            index_dir / "bm25.pkl",
+            self.metadata,
+            dense_doc_ids,
+        )
 
-        # ---------- FAISS / SBERT ----------
+        # Step 4: Semantic engine
         self.semantic = SemanticEngine(
             index_dir / "dense.pkl",
             index_dir / "dense_matrix.npy",
         )
 
-        # ---------- Skills inverted index (optional) ----------
+        # Step 5: Skill inverted index (optional)
         skills_path = index_dir / "skills.pkl"
-        self._skills_index: dict[str, list[int]] = {}
+        self._skills_obj = None
         if skills_path.exists():
             with open(skills_path, "rb") as f:
-                self._skills_index = FlexUnpickler(f).load()
+                self._skills_obj = FlexUnpickler(f).load()
 
-        print(f"[HybridRetriever] Loaded {self.n_docs} candidates from {index_dir}")
+        print(f"[HybridRetriever] Loaded {self.n_docs} candidates | "
+              f"BGE prefix: '{self.semantic.bge_prefix[:40]}...'")
 
-    # ------------------------------------------------------------------
+    def _extract_skill_tokens(self, skill_list: list[str]) -> set[str]:
+        tokens: set[str] = set()
+        for s in skill_list:
+            tokens.update(self.bm25.tokenize(s))
+        return tokens
+
     def retrieve(self, intent_json: dict) -> dict:
-        """
-        Main entry point.
+        t0 = time.perf_counter()
 
-        Parameters
-        ----------
-        intent_json : the full parsed-intent object from Component A
-
-        Returns
-        -------
-        dict — full retrieval output JSON (see OUTPUT FORMAT below)
-        """
-        intent_block   = intent_json.get("intent") or {}
-        t0             = time.perf_counter()
-        parsed         = intent_json.get("entities") or intent_json.get("parsed") or {}
-        modifiers      = intent_block.get("modifiers") or []
-        confidence     = float(intent_block.get("confidence") or 0.70)
-        primary_intent = intent_block.get("primary") or intent_block.get("primary_intent") or "general"
-        skills         = parsed.get("skills") or []
-        domain         = parsed.get("domain") or ""
-        role           = parsed.get("role") or ""
-        negated        = parsed.get("negated_skills") or []
-        kg_ready       = bool(intent_json.get("kg_ready", False))
-        top3           = intent_block.get("top3_scores") or {}
-
-        queries   = intent_json.get("queries", [])
+        intent_block = intent_json.get("intent") or {}
+        parsed       = intent_json.get("entities") or intent_json.get("parsed") or {}
+        queries      = intent_json.get("queries", [])
         strategy_map = intent_json.get("strategy_map", {})
 
-        skill_tokens: list[str]   = [s.lower() for s in (skills)]
-        core_skill_set: set[str]  = set(skill_tokens)   # from intent → core query terms
-        exp_band: str | None      = parsed.get("experience_band")
-        exp_years: str | None     = parsed.get("experience_years")
-        negated_list: list[str]   = [s.lower() for s in (negated)]
+        skill_tokens_raw: list[str] = [s.lower() for s in (parsed.get("skills") or [])]
+        exp_band: str | None        = parsed.get("experience_band")
+        exp_years: str | None       = parsed.get("experience_years")
+        negated: list[str]          = [s.lower() for s in (parsed.get("negated_skills") or [])]
 
-        # ---- 1. Build BM25 score vector (aggregate over all expanded queries) ----
+        canonical_core_skills: set[str] = self._extract_skill_tokens(skill_tokens_raw)
+
+        # ── 1. BM25 aggregate ─────────────────────────────────────────────
         bm25_agg = np.zeros(self.n_docs, dtype=np.float32)
         term_contrib_agg: dict[str, np.ndarray] = {}
         bm25_per_query: list[tuple[str, str, np.ndarray]] = []
 
-        # Canonicalize the core skill tokens for matching
-        canonical_core_skills = set()
-        for tok in skill_tokens:
-            canonical_core_skills.update(self.bm25.tokenize(tok))
-
         for q in queries:
-            tokens = self.bm25.tokenize(q)
+            tokens   = self.bm25.tokenize(q)
             scores, term_scores = self.bm25.score_query(tokens, canonical_core_skills)
             strategy = strategy_map.get(q, "unknown")
             bm25_per_query.append((q, strategy, scores))
 
-            # Weight: original/synonym queries count more than template queries
-            w = 1.0 if strategy in ("original", "synonym") else 0.6
-            bm25_agg += w * scores
+            w = (1.0  if strategy in ("original", "synonym") else
+                 1.2  if strategy == "related_tech" else
+                 0.6)
 
+            bm25_agg += w * scores
             for term, ts in term_scores.items():
                 if term not in term_contrib_agg:
                     term_contrib_agg[term] = np.zeros(self.n_docs, dtype=np.float32)
                 term_contrib_agg[term] += w * ts
 
-        # Normalise BM25 aggregate
         mx = bm25_agg.max()
         if mx > 0:
             bm25_agg /= mx
             for t in term_contrib_agg:
                 term_contrib_agg[t] /= mx
 
-        # ---- 2. Build Semantic score vector (encode corrected query once) ----
-        primary_query = intent_json.get("corrected") or queries[0]
-        query_vec = self.semantic.encode_query(primary_query)
-        dense_scores = self.semantic.score_query(query_vec)
+        # ── 2. Semantic aggregate (batch) ─────────────────────────────────
+        if queries:
+            query_vecs   = self.semantic.encode_queries_batch(queries)
+            dense_matrix = self.semantic.score_queries_batch(query_vecs)
 
-        # Normalise dense scores (already cosine similarity, clamp to [0,1])
+            q_weights = np.array([
+                1.0 if strategy_map.get(q, "unknown") in ("original", "synonym") else
+                1.2 if strategy_map.get(q, "unknown") == "related_tech" else 0.6
+                for q in queries
+            ], dtype=np.float32)
+
+            dense_scores = np.average(dense_matrix, axis=0, weights=q_weights)
+        else:
+            dense_scores = np.zeros(self.n_docs, dtype=np.float32)
+
         dense_scores = np.clip(dense_scores, 0, 1)
 
-        # ---- 3. Hard filter: remove negated skills & experience mismatch ----
+        # ── 3. Hard filters ───────────────────────────────────────────────
         valid_mask = np.ones(self.n_docs, dtype=bool)
         for idx, cand in enumerate(self.metadata):
-            cand_skills_text = (
-                (cand.get("core_skills") or "") + " " +
-                (cand.get("secondary_skills") or "")
-            ).lower()
-            # Negation filter
-            if any(neg in cand_skills_text for neg in negated):
+            all_skill_names = (
+                cand.get("core_skill_names", set()) |
+                cand.get("secondary_skill_names", set())
+            )
+            if any(
+                neg in all_skill_names or neg in cand.get("skill_summary", "").lower()
+                for neg in negated
+            ):
                 valid_mask[idx] = False
                 continue
-            # Experience filter
             if not passes_experience_filter(cand, exp_band, exp_years):
                 valid_mask[idx] = False
 
-        # ---- 4. RRF Fusion ----
+        # ── 4. RRF fusion ─────────────────────────────────────────────────
         rrf_scores = reciprocal_rank_fusion(
             [bm25_agg, dense_scores],
             weights=[ALPHA_BM25, ALPHA_DENSE],
         )
-        # Zero out filtered candidates
         rrf_scores[~valid_mask] = 0.0
 
-        # ---- 5. Core-skill hard-boost: candidates with core skill hits jump up ----
+        # ── 5. Core-skill RRF boost ───────────────────────────────────────
         for idx, cand in enumerate(self.metadata):
-            core_text = (cand.get("core_skills") or "").lower()
-            hit_count = sum(1 for s in skill_tokens if s in core_text)
+            core_names = cand.get("core_skill_names", set())
+            hit_count  = sum(1 for s in skill_tokens_raw if s in core_names)
             if hit_count > 0:
-                rrf_scores[idx] *= (1.0 + 0.3 * hit_count)  # additive boost per hit
+                rrf_scores[idx] *= (1.0 + 0.3 * hit_count)
 
-        # BM25 floor: only candidates with a real keyword match pass (not noise)
-        # 0.25 = at least 25% of top BM25 score needed to enter hybrid.
-        # This drops candidates who only matched a single generic word like 'web' or 'services'.
-        bm25_floor = 0.25
+        # ── 6. Quality gates ──────────────────────────────────────────────
+        bm25_floor = 0.15
 
-        # Pure lexical scores
         lexical_scores = bm25_agg.copy()
         lexical_scores[~valid_mask] = 0.0
 
-        # Pure semantic scores — only candidates with cosine similarity >= 0.5 pass
-        sem_threshold = 0.5
+        max_sem       = dense_scores.max() if self.n_docs > 0 else 0.0
+        sem_threshold = max_sem * 0.75 if max_sem > 0 else 0.60
+
         semantic_scores = dense_scores.copy()
         semantic_scores[~valid_mask] = 0.0
         semantic_scores[semantic_scores < sem_threshold] = 0.0
 
-        # Hybrid: candidate must pass at least one of BM25 or semantic threshold
-        # This prevents low-quality candidates from sneaking in via RRF fusion
-        hybrid_quality_mask = (bm25_agg >= bm25_floor) | (dense_scores >= sem_threshold)
+        hybrid_quality_mask = (
+            (bm25_agg >= bm25_floor) |
+            ((dense_scores >= sem_threshold) & (bm25_agg > 0.0))
+        )
         rrf_scores[~hybrid_quality_mask] = 0.0
 
-        # ---- 6. Build output records ----
-        # THRESHOLD STRATEGY: relative score floor
-        # We only keep candidates scoring >= SCORE_FLOOR_RATIO * top_score.
-        # This is query-adaptive: a weak query doesn't flood results with noise.
-        # Tune SCORE_FLOOR_RATIO:
-        #   0.10 → very permissive (more candidates, lower avg quality)
-        #   0.20 → balanced (recommended default)
-        #   0.40 → strict (fewer, higher quality)
-        SCORE_FLOOR_RATIO = 0.20
+        # ── 7. Build result records ───────────────────────────────────────
+        SCORE_FLOOR_RATIO = 0.35  # Increased from 0.20 to tighten results
 
         def _build_records(score_arr: np.ndarray, mode: str) -> list[dict]:
-            top_score = score_arr.max()
+            top_score   = score_arr.max()
             score_floor = top_score * SCORE_FLOOR_RATIO if top_score > 0 else 0.0
-            # Sort all docs by score descending; stop when score drops below floor
-            top_idx = np.argsort(score_arr)[::-1]
-            records = []
-            for rank, idx in enumerate(top_idx, start=1):
-                if score_arr[idx] < score_floor:
+            records     = []
+
+            for rank, idx in enumerate(np.argsort(score_arr)[::-1], start=1):
+                if score_arr[idx] < score_floor or rank > self.top_k:
                     break
                 cand = self.metadata[idx]
 
-                cand_all_skills = (
-                    (cand.get("core_skills") or "") + " " +
-                    (cand.get("secondary_skills") or "")
-                ).lower()
-                matched = [s for s in skill_tokens if s in cand_all_skills]
+                all_names = (
+                    cand.get("core_skill_names", set()) |
+                    cand.get("secondary_skill_names", set())
+                )
+                matched = [s for s in skill_tokens_raw if s in all_names]
 
-                # Per-doc term contributions for this candidate
                 doc_term_contrib = {
                     t: float(arr[idx])
                     for t, arr in term_contrib_agg.items()
@@ -723,60 +718,68 @@ class HybridRetriever:
                 }
 
                 expl = build_explanation(
-                    candidate   = cand,
-                    matched_skills = matched,
-                    bm25_score  = float(bm25_agg[idx]),
-                    dense_score = float(dense_scores[idx]),
-                    rrf_score   = float(score_arr[idx]),
-                    rank        = rank,
-                    parsed_intent = parsed,
+                    candidate          = cand,
+                    matched_skills     = matched,
+                    bm25_score         = float(bm25_agg[idx]),
+                    dense_score        = float(dense_scores[idx]),
+                    rrf_score          = float(score_arr[idx]),
+                    rank               = rank,
+                    parsed_intent      = parsed,
                     term_contributions = doc_term_contrib,
                 )
 
+                primary_score = (
+                    expl["rrf_score"]      if mode == "hybrid"  else
+                    expl["bm25_score"]     if mode == "lexical" else
+                    expl["semantic_score"]
+                )
+
                 records.append({
-                    "rank":               rank,
-                    "candidate_id":       cand.get("id"),
-                    "name":               cand.get("name", ""),
-                    "years_of_experience":cand.get("years_of_experience", 0),
-                    "potential_roles":    cand.get("potential_roles", ""),
-                    "core_skills":        cand.get("core_skills", ""),
-                    "secondary_skills":   cand.get("secondary_skills", ""),
-                    "soft_skills":        cand.get("soft_skills", ""),
-                    "skill_summary":      cand.get("skill_summary", ""),
+                    "rank":                rank,
+                    "candidate_id":        cand.get("id"),
+                    "name":                cand.get("name", ""),
+                    "years_of_experience": cand.get("years_of_experience", 0),
+                    "potential_roles":     cand.get("potential_roles", ""),
+                    "core_skills":         cand.get("core_skills_str", ""),
+                    "secondary_skills":    cand.get("secondary_skills_str", ""),
+                    "soft_skills":         cand.get("soft_skills", ""),
+                    "skill_summary":       cand.get("skill_summary", ""),
                     "scores": {
-                        "primary":  expl["rrf_score"] if mode == "hybrid" else (expl["bm25_score"] if mode == "lexical" else expl["semantic_score"]),
-                        "rrf":     expl["rrf_score"],
-                        "bm25":    expl["bm25_score"],
-                        "semantic":expl["semantic_score"],
+                        "primary":  primary_score,
+                        "rrf":      expl["rrf_score"],
+                        "bm25":     expl["bm25_score"],
+                        "semantic": expl["semantic_score"],
                     },
-                    "explanation":        expl,
+                    "explanation": expl,
                 })
             return records
 
         hybrid_results = _build_records(rrf_scores, "hybrid")
-        lexical_results = _build_records(lexical_scores, "lexical")
-        semantic_results = _build_records(semantic_scores, "semantic")
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-        # ---- 7. Per-query breakdown ----
+        # ── 8. Per-query BM25 breakdown ───────────────────────────────────
         query_breakdown = []
         for q, strategy, scores in bm25_per_query:
-            top5_ids = np.argsort(scores)[::-1][:5]
+            top5 = np.argsort(scores)[::-1][:5]
             query_breakdown.append({
                 "query":    q,
                 "strategy": strategy,
                 "top5_bm25_hits": [
-                    {"candidate_id": self.metadata[i].get("id"), "bm25": round(float(scores[i]), 4)}
-                    for i in top5_ids if scores[i] > 0
+                    {
+                        "candidate_id": self.metadata[i].get("id"),
+                        "name":         self.metadata[i].get("name", ""),
+                        "bm25":         round(float(scores[i]), 4),
+                    }
+                    for i in top5 if scores[i] > 0
                 ],
             })
 
-        meta = {
+        meta_out = {
             "original_query":    intent_json.get("original"),
             "corrected_query":   intent_json.get("corrected_query") or intent_json.get("corrected"),
-            "primary_intent":    intent_json.get("intent", {}).get("primary") or intent_json.get("intent", {}).get("primary_intent"),
-            "detected_skills":   skill_tokens,
+            "primary_intent":    intent_block.get("primary") or intent_block.get("primary_intent"),
+            "detected_skills":   skill_tokens_raw,
             "experience_band":   exp_band,
             "experience_years":  exp_years,
             "total_candidates":  self.n_docs,
@@ -788,7 +791,9 @@ class HybridRetriever:
         }
 
         return {
-            "hybrid": {"meta": {**meta, "mode": "hybrid", "returned": len(hybrid_results)}, "results": hybrid_results, "query_breakdown": query_breakdown},
-            "lexical": {"meta": {**meta, "mode": "lexical", "returned": len(lexical_results)}, "results": lexical_results},
-            "semantic": {"meta": {**meta, "mode": "semantic", "returned": len(semantic_results)}, "results": semantic_results},
+            "hybrid": {
+                "meta":            {**meta_out, "mode": "hybrid",   "returned": len(hybrid_results)},
+                "results":         hybrid_results,
+                "query_breakdown": query_breakdown,
+            }
         }

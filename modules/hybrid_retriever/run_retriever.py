@@ -151,10 +151,10 @@ def build_mock_index_from_csv(csv_path: str | Path, index_dir: str | Path) -> No
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hybrid Retrieval Engine")
-    parser.add_argument("--index",   default=".", help="Path to index_store/ directory")
+    parser.add_argument("--index",   default="index_store", help="Path to index_store/ directory")
     parser.add_argument("--intent",  required=True,         help="Path to intent JSON file")
     parser.add_argument("--output",  default="results.json",help="Path to output JSON file")
-    parser.add_argument("--top-k",   type=int, default=50,   help="Number of results per mode (use 200 to match KG recall)")
+    parser.add_argument("--top-k",   type=int, default=200,   help="Number of results per mode (use 200 to match KG recall)")
     parser.add_argument("--demo",    action="store_true",   help="Build mock index first (for testing)")
     parser.add_argument("--csv",     default="profiles.csv",help="CSV path (only needed with --demo)")
     args = parser.parse_args()
@@ -168,7 +168,7 @@ def main() -> None:
         intent_json = json.load(f)
 
     # Import and run retriever
-    from retriever import HybridRetriever
+    from search import HybridRetriever
     retriever = HybridRetriever(index_dir=args.index, top_k=args.top_k)
     output    = retriever.retrieve(intent_json)
 
@@ -188,14 +188,7 @@ def main() -> None:
         print(f"       keywords: [{kw}]")
         print(f"       {r['explanation']['why_retrieved'][:90]}")
 
-    print("\nTop 5 Lexical results:")
-    for r in output["lexical"]["results"][:5]:
-        kw = ", ".join(k["term"] for k in r["explanation"]["matched_keywords"][:5])
-        print(f"  #{r['rank']:2d} | {r['name']:<28s} | BM25={r['scores']['bm25']:.4f} | keywords: [{kw}]")
 
-    print("\nTop 5 Semantic results:")
-    for r in output["semantic"]["results"][:5]:
-        print(f"  #{r['rank']:2d} | {r['name']:<28s} | Semantic={r['scores']['semantic']:.4f}")
 
 if __name__ == "__main__":
     main()
