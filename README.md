@@ -1,4 +1,4 @@
-# Nexus — Intent-Aware Hybrid Retrieval System
+# EmployeeKHOJO.ai — Intent-Aware Hybrid Retrieval System
 
 > **Team BackPropBandits** · Built for the *An Intent‑Aware and Explainable Hybrid Retrieval System* problem statement
 
@@ -6,7 +6,7 @@
 
 ## What Is This?
 
-Nexus is an end-to-end intelligent search and retrieval system built for HR candidate shortlisting. Given a natural-language recruiter query like *"senior Python developer fintech 5 years no Java"*, the system identifies intent, expands the query, retrieves relevant candidates through multiple complementary signals, re-ranks them intelligently, and explains every result in plain English — all in a single pipeline.
+EmployeeKHOJO.ai is an end-to-end intelligent search and retrieval system built for HR candidate shortlisting. Given a natural-language recruiter query like *"senior Python developer fintech 5 years no Java"*, the system identifies intent, expands the query, retrieves relevant candidates through multiple complementary signals, re-ranks them intelligently, and explains every result in plain English — all in a single pipeline.
 
 ---
 
@@ -63,7 +63,7 @@ The pipeline has five sequential stages, with hybrid and KG retrieval running in
                     ⑤ Explainability (LLM narration)
                                  │
                                  ▼
-                          Nexus Search UI
+                          EmployeeKHOJO.ai Search UI
 ```
 
 ---
@@ -136,7 +136,7 @@ Each candidate's retrieval signals (BM25 raw score, semantic cosine, RRF rank, K
 
 ### Frontend (`frontend/`)
 
-A React 18 single-page app (`NexusSearch.jsx`) loaded via Babel standalone — no bundler required. Features a dark-mode search interface with animated candidate cards showing score bars, tabbed explanations, and KG-derived signal breakdowns. Hits `GET /search?q=...` and falls back to demo data if the backend is unavailable.
+A React 18 single-page app (`EmployeeKHOJO.aiSearch.jsx`) loaded via Babel standalone — no bundler required. Features a dark-mode search interface with animated candidate cards showing score bars, tabbed explanations, and KG-derived signal breakdowns. Hits `GET /search?q=...` and falls back to demo data if the backend is unavailable.
 
 ---
 
@@ -196,10 +196,9 @@ This produces BM25, FAISS, and skill inverted index artifacts under `data/`. For
 
 ### 5. Build the knowledge graph
 
-Ensure Ollama is running with `qwen2.5:7b`:
+Ensure you have Ollama `qwen2.5:7b` installed in your system.
 
 ```bash
-ollama pull qwen2.5:7b
 cd build_database_and_kg_realtime
 python kg_watcher.py
 ```
@@ -213,7 +212,7 @@ python main.py
 # Serves at http://localhost:8000
 ```
 
-The Nexus search UI is available at `http://localhost:8000`. The API endpoints are:
+The EmployeeKHOJO.ai search UI is available at `http://localhost:8000`. The API endpoints are:
 
 | Endpoint | Description |
 |---|---|
@@ -280,7 +279,7 @@ The system is evaluated using standard IR metrics (Precision@K, Recall@K, MAP, n
 │   └── watch_index.py              # File watcher for BM25/FAISS auto-update
 ├── frontend/
 │   ├── index.html                  # Shell HTML (loads React via Babel)
-│   └── NexusSearch.jsx             # Full search UI component
+│   └── EmployeeKHOJO.aiSearch.jsx             # Full search UI component
 ├── data/                           # Index artifacts (gitignored)
 │   ├── profiles.csv
 │   ├── bm25.pkl
