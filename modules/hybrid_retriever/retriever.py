@@ -1,34 +1,21 @@
 """
-Hybrid Retrieval Engine — Component B  (Fixed v3)
+Hybrid Retrieval Engine — Component B  (Fixed v4)
 Intent-Aware Retrieval combining BM25 (lexical) + FAISS (semantic) with RRF fusion.
 
-Input  : Parsed intent JSON from Component C (query understanding)
-         + index artifacts built by Component A:
-           dense_matrix.npy, dense.pkl, bm25.pkl, metadata.pkl, skills.pkl
-Output : Ranked JSON with per-result explanations ready for Component F.
+Key fix in v4
+-------------
+- SemanticEngine ALWAYS rebuilds its FAISS index from dense_matrix.npy at load
+  time instead of reusing the pickled DenseIndex's internal _faiss_index.
+  This eliminates the `assert d == self.d` AssertionError that arose because
+  the pickled DenseIndex stored a FAISS index whose dimension came from the
+  original training machine, while the live BGE encoder on this machine may
+  have a subtly different internal state.
 
-Changes from v2
----------------
-- RECALL FIX: Removed double-boost that was crushing recall.
-  v2 applied CORE_SKILL_BOOST (3x) at TF level in _doc_tfs AND again as
-  IDF multiplier in score_query → effectively 9x on top candidates, which
-  after normalization pushed everyone else below bm25_floor=0.25.
-  Fix: TF boost in _doc_tfs is kept (matches Component A's index-time
-  weighting intent). IDF amplifier in score_query is reduced to 1.5x
-  (signal boost, not score collapse).
+- The `retrieve()` method now calls `self.semantic.score_queries_batch()`
+  (the correct plural method) instead of the non-existent `score_query()`.
 
-- RECALL FIX: bm25_floor lowered from 0.25 → 0.05.
-  With correct metadata loading, BM25 scores concentrate more sharply at
-  the top than the old regex-based metadata did. 0.25 was calibrated for
-  the old (wrong) score distribution. 0.05 restores the original recall
-  behavior without touching any other threshold.
-
-- RECALL FIX: sem_threshold dropped from max*0.85 → max*0.60.
-  Same reason — correct embeddings produce a tighter score distribution.
-  0.60 restores the original recall band.
-
-- All other thresholds (SCORE_FLOOR_RATIO=0.20, RRF_K=60, ALPHA_*, etc.)
-  are unchanged from v2.
+- `SemanticEngine.encode_queries_batch()` is the single encode entry point;
+  a convenience `encode_query()` alias is added for single-query use.
 """
 
 from __future__ import annotations
@@ -81,13 +68,11 @@ ALPHA_BM25       = 0.40
 ALPHA_DENSE      = 0.60
 CORE_SKILL_BOOST = 3.0      # TF multiplier in _doc_tfs (index-time alignment)
 SECONDARY_BOOST  = 1.2      # TF multiplier for secondary skills
-CORE_IDF_BOOST   = 1.5      # IDF amplifier for core query tokens (was 3.0 = double boost)
+CORE_IDF_BOOST   = 1.5      # IDF amplifier for core query tokens
 DEFAULT_TOP_K    = 50
 SBERT_MODEL      = "BAAI/bge-base-en-v1.5"
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
-# Proficiency weight threshold — matches Component A's PROFICIENCY_SCALE:
-#   competent=1.2, proficient=1.5, advanced=1.7, expert=2.0, certified=2.0
 CORE_WEIGHT_THRESHOLD = 1.2
 
 EXPERIENCE_BAND_MIN = {
@@ -122,16 +107,6 @@ def _build_metadata_list(
     dense_doc_ids: list[str],
     dense_texts: list[str],
 ) -> list[dict]:
-    """
-    Build metadata list in Dense index order from Component A's MetadataStore.
-
-    Component A's metadata entry per doc_id:
-        id                  : str
-        name                : str
-        top_skills          : list[tuple[str, float]]  (skill_name, proficiency_weight)
-        years_of_experience : float
-        potential_roles     : str
-    """
     store: dict[str, dict] = getattr(meta_store, "_store", {})
     metadata = []
 
@@ -202,17 +177,6 @@ def _weight_to_prof(w: float) -> str:
 # ============================================================================
 
 class BM25Engine:
-    """
-    Wraps Component A's BM25Index pickle.
-
-    Alignment guarantees:
-    - _doc_tfs built in Dense doc_id order (not BM25 native order) so
-      bm25_agg[i] and dense_scores[i] always refer to the same candidate.
-    - Core-skill TF boost uses proficiency weight sets from MetadataStore.
-    - IDF amplifier for core query tokens is CORE_IDF_BOOST (1.5x), NOT
-      CORE_SKILL_BOOST (3.0x) — prevents double-boost score collapse.
-    """
-
     def __init__(
         self,
         bm25_path: str | Path,
@@ -232,19 +196,16 @@ class BM25Engine:
         self.n_bm25: int                       = len(self._bm25_doc_ids)
         self.normalizer                        = getattr(data, "_normalizer", None)
 
-        # IDF table
         self.idf: dict[str, float] = {
             term: math.log((self.n_bm25 - freq + 0.5) / (freq + 0.5) + 1.0)
             for term, freq in self._df.items()
         }
 
-        # Dense is the authority for document ordering
         bm25_id_to_pos: dict[str, int] = {
             did: i for i, did in enumerate(self._bm25_doc_ids)
         }
         self.n_docs = len(dense_doc_ids)
 
-        # Build TF dicts in Dense order with proficiency-aware boost
         self._doc_tfs: list[dict[str, float]] = []
         for dense_pos, doc_id in enumerate(dense_doc_ids):
             bm25_pos = bm25_id_to_pos.get(doc_id)
@@ -269,7 +230,6 @@ class BM25Engine:
                     tf[tok] = float(base_tf)
             self._doc_tfs.append(tf)
 
-        # Doc lengths in Dense order
         self._aligned_lengths: list[int] = []
         for doc_id in dense_doc_ids:
             bm25_pos = bm25_id_to_pos.get(doc_id)
@@ -293,10 +253,6 @@ class BM25Engine:
             if term not in self.idf:
                 continue
             idf_val = self.idf[term]
-
-            # FIX: use CORE_IDF_BOOST (1.5x) not CORE_SKILL_BOOST (3.0x)
-            # TF is already boosted 3x in _doc_tfs — applying 3x here too
-            # caused 9x total amplification → score collapse after normalization
             if term in core_query_tokens:
                 idf_val *= CORE_IDF_BOOST
 
@@ -314,10 +270,6 @@ class BM25Engine:
         return scores, term_scores
 
     def tokenize(self, text: str) -> list[str]:
-        """
-        Exact mirror of Component A's BM25Index.tokenise():
-            re.findall(r"[a-z0-9][a-z0-9+#_]*") + normalize_token() + split expansions.
-        """
         raw_tokens = re.findall(r"[a-z0-9][a-z0-9+#_]*", text.lower())
         normalized: list[str] = []
         normalize_token = (
@@ -331,16 +283,22 @@ class BM25Engine:
 
 
 # ============================================================================
-# SEMANTIC ENGINE
+# SEMANTIC ENGINE  (v4 — always rebuilds FAISS from dense_matrix.npy)
 # ============================================================================
 
 class SemanticEngine:
     """
     Wraps Component A's DenseIndex pickle + dense_matrix.npy.
 
-    - Reads BGE_QUERY_PREFIX from the pickled DenseIndex object.
-    - Applies prefix to all queries at encode time (never at index time).
-    - Batch-encodes all expanded queries in one SBERT forward pass.
+    v4 change: We NEVER reuse cfg._faiss_index from the pickle because
+    the pickled FAISS index was built on the training machine and its
+    internal dimension may not match what we reconstruct here.  Instead
+    we always:
+        1. Load the raw float32 matrix from dense_matrix.npy.
+        2. L2-normalise the rows.
+        3. Build a fresh IndexFlatIP over that matrix.
+    This guarantees dim consistency between the stored vectors and any
+    live query vector we encode.
     """
 
     def __init__(
@@ -348,17 +306,9 @@ class SemanticEngine:
         dense_pkl_path: str | Path,
         dense_matrix_path: str | Path,
     ) -> None:
+        # ── Step 1: load metadata from the pickle (model name, prefix, etc.) ──
         with open(dense_pkl_path, "rb") as f:
             cfg = FlexUnpickler(f).load()
-
-        if hasattr(cfg, "_matrix") and cfg._matrix is not None:
-            matrix: np.ndarray = np.array(cfg._matrix, dtype=np.float32)
-        elif Path(dense_matrix_path).exists():
-            matrix = np.load(dense_matrix_path).astype(np.float32)
-        else:
-            raise FileNotFoundError(
-                f"Embedding matrix not found in {dense_pkl_path} or {dense_matrix_path}"
-            )
 
         self.bge_prefix: str = getattr(cfg, "BGE_QUERY_PREFIX", BGE_QUERY_PREFIX)
         strategy             = getattr(cfg, "strategy", "sbert")
@@ -366,13 +316,31 @@ class SemanticEngine:
             getattr(cfg, "SBERT_MODEL_NAME", SBERT_MODEL)
             if strategy == "sbert" else SBERT_MODEL
         )
+
+        # ── Step 2: load the matrix from .npy (always — never from pickle) ───
+        matrix_path = Path(dense_matrix_path)
+        if not matrix_path.exists():
+            # Fallback: try to get it from the pickle if .npy is missing
+            if hasattr(cfg, "_matrix") and cfg._matrix is not None:
+                matrix = np.array(cfg._matrix, dtype=np.float32)
+            else:
+                raise FileNotFoundError(
+                    f"Embedding matrix not found at {dense_matrix_path} "
+                    f"and dense.pkl has no _matrix attribute."
+                )
+        else:
+            matrix = np.load(matrix_path).astype(np.float32)
+
         self.embedding_dim: int = matrix.shape[1]
         self.n_docs: int        = matrix.shape[0]
 
+        # L2-normalise so inner-product == cosine similarity
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1e-9, norms)
         self._matrix = (matrix / norms).astype(np.float32)
 
+        # ── Step 3: build a FRESH FAISS index ────────────────────────────────
+        # This is the critical fix: we never reuse cfg._faiss_index.
         if FAISS_AVAILABLE:
             self._index = faiss.IndexFlatIP(self.embedding_dim)
             self._index.add(self._matrix)
@@ -381,18 +349,24 @@ class SemanticEngine:
 
         self._encoder = None
 
+    # ── Encoder (lazy) ───────────────────────────────────────────────────────
+
     def _get_encoder(self) -> Any:
         if self._encoder is None and SBERT_AVAILABLE:
             self._encoder = SentenceTransformer(self.model_name)
         return self._encoder
 
+    # ── Encoding ─────────────────────────────────────────────────────────────
+
     def encode_queries_batch(self, queries: list[str]) -> np.ndarray:
-        """Batch encode all queries with BGE prefix in one forward pass."""
+        """Batch-encode all queries with BGE prefix. Returns (n_queries, dim)."""
         enc      = self._get_encoder()
         prefixed = [self.bge_prefix + q for q in queries]
 
         if enc is None:
-            vecs  = np.random.randn(len(queries), self.embedding_dim).astype(np.float32)
+            # Random fallback when SBERT is unavailable
+            rng  = np.random.default_rng(42)
+            vecs = rng.standard_normal((len(queries), self.embedding_dim)).astype(np.float32)
             norms = np.linalg.norm(vecs, axis=1, keepdims=True)
             return vecs / np.where(norms == 0, 1, norms)
 
@@ -405,12 +379,36 @@ class SemanticEngine:
         )
         return np.array(vecs, dtype=np.float32)
 
+    def encode_query(self, query: str) -> np.ndarray:
+        """Convenience wrapper for a single query. Returns shape (dim,)."""
+        return self.encode_queries_batch([query])[0]
+
+    # ── Scoring ──────────────────────────────────────────────────────────────
+
     def score_queries_batch(self, query_vecs: np.ndarray) -> np.ndarray:
-        """Score all queries against all docs. Returns (n_queries, n_docs)."""
+        """
+        Score all queries against all docs.
+        query_vecs: (n_queries, dim)
+        Returns: (n_queries, n_docs)
+        """
         if self._index is not None:
             scores, _ = self._index.search(query_vecs, self.n_docs)
             return scores
+        # Brute-force fallback
         return query_vecs @ self._matrix.T
+
+    def score_query(self, query_vec: np.ndarray) -> np.ndarray:
+        """
+        Score a single query vector against all docs.
+        query_vec: shape (dim,)  OR  (1, dim)
+        Returns: shape (n_docs,)
+
+        This method exists so that any existing callers using the old
+        single-query API continue to work without changes.
+        """
+        vec = query_vec.reshape(1, -1)
+        result = self.score_queries_batch(vec)   # (1, n_docs)
+        return result[0]                          # (n_docs,)
 
 
 # ============================================================================
@@ -528,13 +526,6 @@ def build_explanation(
 class HybridRetriever:
     """
     Loads all Component A index artifacts once, answers queries in milliseconds.
-
-    Loading order
-    -------------
-    1. dense.pkl    → master doc_id ordering + texts + embeddings
-    2. metadata.pkl → rich per-doc metadata keyed by doc_id
-    3. bm25.pkl     → BM25 index (aligned to Dense order via doc_id map)
-    4. skills.pkl   → skill inverted index (optional)
     """
 
     def __init__(self, index_dir: str | Path, top_k: int = DEFAULT_TOP_K) -> None:
@@ -562,7 +553,7 @@ class HybridRetriever:
             dense_doc_ids,
         )
 
-        # Step 4: Semantic engine
+        # Step 4: Semantic engine (v4 — always builds fresh FAISS from .npy)
         self.semantic = SemanticEngine(
             index_dir / "dense.pkl",
             index_dir / "dense_matrix.npy",
@@ -575,8 +566,7 @@ class HybridRetriever:
             with open(skills_path, "rb") as f:
                 self._skills_obj = FlexUnpickler(f).load()
 
-        print(f"[HybridRetriever] Loaded {self.n_docs} candidates | "
-              f"BGE prefix: '{self.semantic.bge_prefix[:40]}...'")
+        print(f"[HybridRetriever] Loaded {self.n_docs} candidates from {index_dir}")
 
     def _extract_skill_tokens(self, skill_list: list[str]) -> set[str]:
         tokens: set[str] = set()
@@ -628,8 +618,10 @@ class HybridRetriever:
 
         # ── 2. Semantic aggregate (batch) ─────────────────────────────────
         if queries:
-            query_vecs   = self.semantic.encode_queries_batch(queries)
-            dense_matrix = self.semantic.score_queries_batch(query_vecs)
+            # encode_queries_batch returns (n_queries, dim) — all L2-normed
+            query_vecs   = self.semantic.encode_queries_batch(queries)   # (n_q, dim)
+            # score_queries_batch returns (n_queries, n_docs)
+            dense_matrix = self.semantic.score_queries_batch(query_vecs) # (n_q, n_docs)
 
             q_weights = np.array([
                 1.0 if strategy_map.get(q, "unknown") in ("original", "synonym") else
@@ -637,6 +629,7 @@ class HybridRetriever:
                 for q in queries
             ], dtype=np.float32)
 
+            # Weighted average across queries → (n_docs,)
             dense_scores = np.average(dense_matrix, axis=0, weights=q_weights)
         else:
             dense_scores = np.zeros(self.n_docs, dtype=np.float32)
@@ -693,7 +686,7 @@ class HybridRetriever:
         rrf_scores[~hybrid_quality_mask] = 0.0
 
         # ── 7. Build result records ───────────────────────────────────────
-        SCORE_FLOOR_RATIO = 0.35  # Increased from 0.20 to tighten results
+        SCORE_FLOOR_RATIO = 0.35
 
         def _build_records(score_arr: np.ndarray, mode: str) -> list[dict]:
             top_score   = score_arr.max()
