@@ -3,10 +3,6 @@
 Teammate API   : HybridRetriever.retrieve(intent_json) -> {hybrid:{results}, ...}
 Orchestrator   : retrieve(intent_dict) -> {"candidates": [{"id","score",...}], ...}
 
-The HybridRetriever needs the FULL parsed intent (skills, negated_skills, exp band,
-etc.) to apply hard filters — so this adapter accepts the canonical intent dict
-emitted by `modules.intent_processor.process()`, not just the queries list.
-
 Index dir resolution order: $INDEX_DIR → $DATA_DIR → ./data
 """
 
@@ -20,12 +16,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Expose package dir on sys.path so internal imports resolve
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PKG_DIR not in sys.path:
     sys.path.insert(0, _PKG_DIR)
 
-_retriever = None  # cached HybridRetriever instance
+_retriever = None
 
 
 def _resolve_index_dir() -> Path:
@@ -48,23 +43,15 @@ def _get_retriever():
 def _flatten(raw: dict) -> dict:
     """
     Teammate's nested {hybrid|lexical|semantic} → orchestrator's flat candidates list.
-
-    Each candidate in the output has BOTH:
-      - "id"           (orchestrator/_tag_and_combine contract)
-      - "candidate_id" (reranker contract)
-    so every downstream consumer can use whichever key it expects.
+    Each candidate carries both "id" (orchestrator) and "candidate_id" (reranker).
     """
     hybrid_block = raw.get("hybrid") or {}
     candidates: list[dict[str, Any]] = []
 
     for r in hybrid_block.get("results", []):
         scores = r.get("scores") or {}
-
-        # candidate_id comes from the retriever; normalise to string
-        cid = str(r.get("candidate_id")) if r.get("candidate_id") is not None else None
-
+        cid    = str(r.get("candidate_id")) if r.get("candidate_id") is not None else None
         candidates.append({
-            # Both key names — orchestrator uses "id", reranker uses "candidate_id"
             "id":                  cid,
             "candidate_id":        cid,
             "score":               scores.get("primary") or scores.get("rrf"),
@@ -91,26 +78,13 @@ def _flatten(raw: dict) -> dict:
 
 def retrieve(intent: dict | list) -> dict:
     """
-    Run hybrid (BM25 + dense) retrieval and return orchestrator-shaped dict:
+    Run hybrid retrieval and return orchestrator-shaped dict.
 
-        {
-            "candidates": [{"id", "candidate_id", "score", ...}],
-            "lexical":    ...,
-            "semantic":   ...,
-            "meta":       ...,
-            "query_breakdown": ...,
-        }
-
-    `intent` may be:
-      - The canonical intent dict from `modules.intent_processor.process()`
-        (preferred — carries parsed entities for hard filtering).
-      - A bare list of query strings (backward-compat; wrapped into a minimal
-        intent stub so the retriever's query loop still works).
+    Accepts:
+      - Full canonical intent dict from modules.intent_processor.process()
+      - Bare list of query strings (backward-compat)
     """
     if isinstance(intent, list):
-        # Backward-compat: caller passed just the queries list.
-        # Wrap into a minimal intent dict so the retriever's internal logic
-        # (strategy_map, parsed entities, etc.) still functions gracefully.
         intent = {
             "queries":             intent,
             "corrected":           intent[0] if intent else "",

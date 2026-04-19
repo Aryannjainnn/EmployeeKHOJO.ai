@@ -1,21 +1,22 @@
 """
-Hybrid Retrieval Engine — Component B  (Fixed v4)
-Intent-Aware Retrieval combining BM25 (lexical) + FAISS (semantic) with RRF fusion.
+Hybrid Retrieval Engine — Component B  (Fixed v5)
 
-Key fix in v4
--------------
-- SemanticEngine ALWAYS rebuilds its FAISS index from dense_matrix.npy at load
-  time instead of reusing the pickled DenseIndex's internal _faiss_index.
-  This eliminates the `assert d == self.d` AssertionError that arose because
-  the pickled DenseIndex stored a FAISS index whose dimension came from the
-  original training machine, while the live BGE encoder on this machine may
-  have a subtly different internal state.
+Fixes vs v4
+-----------
+1. BM25Engine.tokenize() — CanonicalNormalizer from Component A's indexer.py
+   does not expose `normalize_token` in all versions.  We now check for the
+   method and fall back to a plain identity function so the tokenizer never
+   crashes regardless of which normalizer version is pickled.
 
-- The `retrieve()` method now calls `self.semantic.score_queries_batch()`
-  (the correct plural method) instead of the non-existent `score_query()`.
+2. SemanticEngine.__init__() — dense.pkl contains a pickled SentenceTransformer
+   (PyTorch) object.  When unpickling on a machine whose GPU is full the
+   default CUDA restore throws OutOfMemoryError.  We patch torch's restore
+   function to force CPU before unpickling, then move the encoder to the
+   best available GPU only when we actually need to encode.
 
-- `SemanticEngine.encode_queries_batch()` is the single encode entry point;
-  a convenience `encode_query()` alias is added for single-query use.
+3. _pick_device() — scans GPUs 0-7 via nvidia-smi and picks the one with
+   the most free VRAM.  Falls back to CPU if none are available or if
+   torch.cuda is not accessible.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import math
 import re
 import time
 import pickle
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +36,6 @@ import numpy as np
 # ============================================================================
 
 class FlexUnpickler(pickle.Unpickler):
-    """Gracefully handles missing Component A classes when unpickling."""
     def find_class(self, module, name):
         try:
             return super().find_class(module, name)
@@ -58,6 +59,12 @@ try:
 except ImportError:
     SBERT_AVAILABLE = False
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 
 # ============================================================================
 # CONSTANTS
@@ -66,13 +73,12 @@ except ImportError:
 RRF_K            = 60
 ALPHA_BM25       = 0.40
 ALPHA_DENSE      = 0.60
-CORE_SKILL_BOOST = 3.0      # TF multiplier in _doc_tfs (index-time alignment)
-SECONDARY_BOOST  = 1.2      # TF multiplier for secondary skills
-CORE_IDF_BOOST   = 1.5      # IDF amplifier for core query tokens
+CORE_SKILL_BOOST = 3.0
+SECONDARY_BOOST  = 1.2
+CORE_IDF_BOOST   = 1.5
 DEFAULT_TOP_K    = 50
 SBERT_MODEL      = "BAAI/bge-base-en-v1.5"
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
-
 CORE_WEIGHT_THRESHOLD = 1.2
 
 EXPERIENCE_BAND_MIN = {
@@ -99,7 +105,87 @@ STOPWORDS: frozenset[str] = frozenset({
 
 
 # ============================================================================
-# HELPER — build rich metadata from Component A's MetadataStore
+# GPU SELECTION UTILITY
+# ============================================================================
+
+def _pick_device() -> str:
+    """
+    Return the torch device string for the GPU with the most free VRAM
+    among GPUs 0-7.  Falls back to 'cpu' if no GPU has >= 1 GB free.
+    """
+    if not TORCH_AVAILABLE:
+        return "cpu"
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("nvidia-smi failed")
+
+        best_idx  = -1
+        best_free = 0
+        for line in result.stdout.strip().splitlines():
+            parts = line.strip().split(",")
+            if len(parts) != 2:
+                continue
+            gpu_idx  = int(parts[0].strip())
+            free_mib = int(parts[1].strip())
+            if free_mib > best_free:
+                best_free = free_mib
+                best_idx  = gpu_idx
+
+        if best_idx >= 0 and best_free >= 1024:   # require ≥ 1 GB free
+            print(f"[HybridRetriever] Using GPU {best_idx} "
+                  f"({best_free} MiB free) for SBERT encoding")
+            return f"cuda:{best_idx}"
+
+        print(f"[HybridRetriever] No GPU with ≥1 GB free "
+              f"(best={best_free} MiB on GPU {best_idx}). Using CPU.")
+        return "cpu"
+
+    except Exception as exc:
+        print(f"[HybridRetriever] GPU selection failed ({exc}). Using CPU.")
+        return "cpu"
+
+
+# ============================================================================
+# SAFE CPU UNPICKLE FOR PYTORCH OBJECTS
+# ============================================================================
+
+def _load_pkl_on_cpu(path: str | Path) -> Any:
+    """
+    Unpickle a file that may contain PyTorch tensors/storages, forcing
+    everything onto CPU regardless of where it was originally saved.
+    This avoids CUDA OOM when dense.pkl contains a pickled SentenceTransformer
+    whose tensors were saved on a GPU that is full on the current machine.
+    """
+    if not TORCH_AVAILABLE:
+        with open(path, "rb") as f:
+            return FlexUnpickler(f).load()
+
+    import torch
+
+    original_restore = torch.serialization.default_restore_location
+
+    def _cpu_restore(storage, location):
+        return original_restore(storage, "cpu")
+
+    torch.serialization.default_restore_location = _cpu_restore
+    try:
+        with open(path, "rb") as f:
+            obj = FlexUnpickler(f).load()
+    finally:
+        torch.serialization.default_restore_location = original_restore
+
+    return obj
+
+
+# ============================================================================
+# METADATA BUILDER
 # ============================================================================
 
 def _build_metadata_list(
@@ -131,10 +217,8 @@ def _build_metadata_list(
             continue
 
         top_skills: list[tuple[str, float]] = raw.get("top_skills") or []
-
         core_skills      = [(s, w) for s, w in top_skills if w >= CORE_WEIGHT_THRESHOLD]
         secondary_skills = [(s, w) for s, w in top_skills if w <  CORE_WEIGHT_THRESHOLD]
-
         core_skill_names      = {s for s, _ in core_skills}
         secondary_skill_names = {s for s, _ in secondary_skills}
 
@@ -186,15 +270,25 @@ class BM25Engine:
         with open(bm25_path, "rb") as f:
             data = FlexUnpickler(f).load()
 
-        self._bm25_doc_ids: list[str]         = getattr(data, "_doc_ids", [])
-        self._doc_freqs: list[dict[str, int]]  = getattr(data, "_doc_freqs", [])
-        self._doc_lengths: list[int]           = getattr(data, "_doc_lengths", [])
-        self._df: dict[str, int]               = getattr(data, "_df", {})
-        self.avgdl: float                      = getattr(data, "_avgdl", 50.0)
-        self.k1: float                         = getattr(data, "k1", 1.5)
-        self.b: float                          = getattr(data, "b", 0.75)
-        self.n_bm25: int                       = len(self._bm25_doc_ids)
-        self.normalizer                        = getattr(data, "_normalizer", None)
+        self._bm25_doc_ids: list[str]        = getattr(data, "_doc_ids", [])
+        self._doc_freqs: list[dict[str, int]] = getattr(data, "_doc_freqs", [])
+        self._doc_lengths: list[int]          = getattr(data, "_doc_lengths", [])
+        self._df: dict[str, int]              = getattr(data, "_df", {})
+        self.avgdl: float                     = getattr(data, "_avgdl", 50.0)
+        self.k1: float                        = getattr(data, "k1", 1.5)
+        self.b: float                         = getattr(data, "b", 0.75)
+        self.n_bm25: int                      = len(self._bm25_doc_ids)
+
+        # ── Safe normalize_token callable ─────────────────────────────────
+        # CanonicalNormalizer may or may not have normalize_token depending
+        # on the version that built the index.  Probe once; store a safe fn.
+        raw_norm = getattr(data, "_normalizer", None)
+        if raw_norm is not None and hasattr(raw_norm, "normalize_token"):
+            self._normalize_token = raw_norm.normalize_token
+        elif raw_norm is not None and hasattr(raw_norm, "normalize_skill"):
+            self._normalize_token = raw_norm.normalize_skill
+        else:
+            self._normalize_token = lambda t: t   # identity fallback
 
         self.idf: dict[str, float] = {
             term: math.log((self.n_bm25 - freq + 0.5) / (freq + 0.5) + 1.0)
@@ -212,13 +306,10 @@ class BM25Engine:
             if bm25_pos is None:
                 self._doc_tfs.append({})
                 continue
-
             raw_tf = self._doc_freqs[bm25_pos]
             meta   = metadata[dense_pos]
-
             core_names      = meta.get("core_skill_names", set())
             secondary_names = meta.get("secondary_skill_names", set())
-
             tf: dict[str, float] = {}
             for tok, base_tf in raw_tf.items():
                 tok_space = tok.replace("_", " ")
@@ -237,6 +328,18 @@ class BM25Engine:
                 self._aligned_lengths.append(self._doc_lengths[bm25_pos])
             else:
                 self._aligned_lengths.append(int(self.avgdl))
+
+    def tokenize(self, text: str) -> list[str]:
+        """Mirror of Component A's BM25Index.tokenise() — safe for any normalizer."""
+        raw_tokens = re.findall(r"[a-z0-9][a-z0-9+#_]*", text.lower())
+        normalized: list[str] = []
+        for t in raw_tokens:
+            try:
+                expanded = self._normalize_token(t)
+                normalized.extend(str(expanded).split())
+            except Exception:
+                normalized.append(t)
+        return normalized
 
     def score_query(
         self,
@@ -264,41 +367,20 @@ class BM25Engine:
                 tf_norm = (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm[i])
                 t_scores[i] = idf_val * tf_norm
 
-            scores          += t_scores
+            scores           += t_scores
             term_scores[term] = t_scores
 
         return scores, term_scores
 
-    def tokenize(self, text: str) -> list[str]:
-        raw_tokens = re.findall(r"[a-z0-9][a-z0-9+#_]*", text.lower())
-        normalized: list[str] = []
-        normalize_token = (
-            self.normalizer.normalize_token
-            if self.normalizer
-            else lambda t: t
-        )
-        for t in raw_tokens:
-            normalized.extend(normalize_token(t).split())
-        return normalized
-
 
 # ============================================================================
-# SEMANTIC ENGINE  (v4 — always rebuilds FAISS from dense_matrix.npy)
+# SEMANTIC ENGINE  (v5)
 # ============================================================================
 
 class SemanticEngine:
     """
-    Wraps Component A's DenseIndex pickle + dense_matrix.npy.
-
-    v4 change: We NEVER reuse cfg._faiss_index from the pickle because
-    the pickled FAISS index was built on the training machine and its
-    internal dimension may not match what we reconstruct here.  Instead
-    we always:
-        1. Load the raw float32 matrix from dense_matrix.npy.
-        2. L2-normalise the rows.
-        3. Build a fresh IndexFlatIP over that matrix.
-    This guarantees dim consistency between the stored vectors and any
-    live query vector we encode.
+    v5: dense.pkl loaded on CPU to avoid GPU OOM; SBERT encoder placed on
+    the GPU with the most free VRAM (found by _pick_device at encode time).
     """
 
     def __init__(
@@ -306,9 +388,8 @@ class SemanticEngine:
         dense_pkl_path: str | Path,
         dense_matrix_path: str | Path,
     ) -> None:
-        # ── Step 1: load metadata from the pickle (model name, prefix, etc.) ──
-        with open(dense_pkl_path, "rb") as f:
-            cfg = FlexUnpickler(f).load()
+        # Load metadata only — force CPU to avoid CUDA OOM
+        cfg = _load_pkl_on_cpu(dense_pkl_path)
 
         self.bge_prefix: str = getattr(cfg, "BGE_QUERY_PREFIX", BGE_QUERY_PREFIX)
         strategy             = getattr(cfg, "strategy", "sbert")
@@ -317,56 +398,52 @@ class SemanticEngine:
             if strategy == "sbert" else SBERT_MODEL
         )
 
-        # ── Step 2: load the matrix from .npy (always — never from pickle) ───
+        # Load matrix from .npy — always on CPU/numpy, no CUDA involved
         matrix_path = Path(dense_matrix_path)
-        if not matrix_path.exists():
-            # Fallback: try to get it from the pickle if .npy is missing
-            if hasattr(cfg, "_matrix") and cfg._matrix is not None:
-                matrix = np.array(cfg._matrix, dtype=np.float32)
-            else:
-                raise FileNotFoundError(
-                    f"Embedding matrix not found at {dense_matrix_path} "
-                    f"and dense.pkl has no _matrix attribute."
-                )
-        else:
+        if matrix_path.exists():
             matrix = np.load(matrix_path).astype(np.float32)
+        elif hasattr(cfg, "_matrix") and cfg._matrix is not None:
+            matrix = np.array(cfg._matrix, dtype=np.float32)
+        else:
+            raise FileNotFoundError(
+                f"Embedding matrix not found at {dense_matrix_path}"
+            )
 
         self.embedding_dim: int = matrix.shape[1]
         self.n_docs: int        = matrix.shape[0]
 
-        # L2-normalise so inner-product == cosine similarity
+        # L2-normalise rows → inner product == cosine similarity
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1e-9, norms)
         self._matrix = (matrix / norms).astype(np.float32)
 
-        # ── Step 3: build a FRESH FAISS index ────────────────────────────────
-        # This is the critical fix: we never reuse cfg._faiss_index.
+        # Build a fresh FAISS index — never reuse the pickled one
         if FAISS_AVAILABLE:
             self._index = faiss.IndexFlatIP(self.embedding_dim)
             self._index.add(self._matrix)
         else:
             self._index = None
 
-        self._encoder = None
-
-    # ── Encoder (lazy) ───────────────────────────────────────────────────────
+        self._encoder = None   # lazy — created on first encode call
 
     def _get_encoder(self) -> Any:
-        if self._encoder is None and SBERT_AVAILABLE:
-            self._encoder = SentenceTransformer(self.model_name)
+        if self._encoder is not None:
+            return self._encoder
+        if not SBERT_AVAILABLE:
+            return None
+        device = _pick_device()
+        print(f"[SemanticEngine] Loading '{self.model_name}' on {device}")
+        self._encoder = SentenceTransformer(self.model_name, device=device)
         return self._encoder
 
-    # ── Encoding ─────────────────────────────────────────────────────────────
-
     def encode_queries_batch(self, queries: list[str]) -> np.ndarray:
-        """Batch-encode all queries with BGE prefix. Returns (n_queries, dim)."""
+        """Returns (n_queries, dim) float32 array."""
         enc      = self._get_encoder()
         prefixed = [self.bge_prefix + q for q in queries]
 
         if enc is None:
-            # Random fallback when SBERT is unavailable
-            rng  = np.random.default_rng(42)
-            vecs = rng.standard_normal((len(queries), self.embedding_dim)).astype(np.float32)
+            rng   = np.random.default_rng(42)
+            vecs  = rng.standard_normal((len(queries), self.embedding_dim)).astype(np.float32)
             norms = np.linalg.norm(vecs, axis=1, keepdims=True)
             return vecs / np.where(norms == 0, 1, norms)
 
@@ -380,35 +457,19 @@ class SemanticEngine:
         return np.array(vecs, dtype=np.float32)
 
     def encode_query(self, query: str) -> np.ndarray:
-        """Convenience wrapper for a single query. Returns shape (dim,)."""
+        """Single-query convenience wrapper."""
         return self.encode_queries_batch([query])[0]
 
-    # ── Scoring ──────────────────────────────────────────────────────────────
-
     def score_queries_batch(self, query_vecs: np.ndarray) -> np.ndarray:
-        """
-        Score all queries against all docs.
-        query_vecs: (n_queries, dim)
-        Returns: (n_queries, n_docs)
-        """
+        """(n_queries, dim) → (n_queries, n_docs)."""
         if self._index is not None:
             scores, _ = self._index.search(query_vecs, self.n_docs)
             return scores
-        # Brute-force fallback
         return query_vecs @ self._matrix.T
 
     def score_query(self, query_vec: np.ndarray) -> np.ndarray:
-        """
-        Score a single query vector against all docs.
-        query_vec: shape (dim,)  OR  (1, dim)
-        Returns: shape (n_docs,)
-
-        This method exists so that any existing callers using the old
-        single-query API continue to work without changes.
-        """
-        vec = query_vec.reshape(1, -1)
-        result = self.score_queries_batch(vec)   # (1, n_docs)
-        return result[0]                          # (n_docs,)
+        """Single query (dim,) → (n_docs,). Backward-compat alias."""
+        return self.score_queries_batch(query_vec.reshape(1, -1))[0]
 
 
 # ============================================================================
@@ -422,16 +483,13 @@ def reciprocal_rank_fusion(
 ) -> np.ndarray:
     if weights is None:
         weights = [1.0] * len(rank_lists)
-
     n_docs = rank_lists[0].shape[0]
     fused  = np.zeros(n_docs, dtype=np.float64)
-
     for score_arr, w in zip(rank_lists, weights):
         order = np.argsort(score_arr)[::-1]
         ranks = np.empty_like(order)
         ranks[order] = np.arange(n_docs)
         fused += w * (1.0 / (k + ranks + 1))
-
     return fused.astype(np.float32)
 
 
@@ -445,7 +503,6 @@ def passes_experience_filter(
     experience_years: str | None,
 ) -> bool:
     cand_years = float(candidate.get("years_of_experience") or 0)
-
     if experience_years:
         try:
             req = float(experience_years)
@@ -453,12 +510,10 @@ def passes_experience_filter(
                 return False
         except ValueError:
             pass
-
     if experience_band:
         min_yr = EXPERIENCE_BAND_MIN.get(experience_band.lower(), 0)
         if cand_years < max(0, min_yr - 1):
             return False
-
     return True
 
 
@@ -478,7 +533,6 @@ def build_explanation(
 ) -> dict:
     core_names      = candidate.get("core_skill_names", set())
     secondary_names = candidate.get("secondary_skill_names", set())
-
     core_hits = [s for s in matched_skills if s in core_names]
     sec_hits  = [s for s in matched_skills if s in secondary_names and s not in core_hits]
 
@@ -491,7 +545,6 @@ def build_explanation(
         signals.append(f"Keyword relevance (BM25={bm25_score:.3f})")
     if dense_score > 0.5:
         signals.append(f"Semantic similarity (cos={dense_score:.3f})")
-
     exp_band = parsed_intent.get("experience_band")
     if exp_band:
         signals.append(
@@ -524,17 +577,12 @@ def build_explanation(
 # ============================================================================
 
 class HybridRetriever:
-    """
-    Loads all Component A index artifacts once, answers queries in milliseconds.
-    """
-
     def __init__(self, index_dir: str | Path, top_k: int = DEFAULT_TOP_K) -> None:
         index_dir  = Path(index_dir)
         self.top_k = top_k
 
-        # Step 1: Dense — master ordering
-        with open(index_dir / "dense.pkl", "rb") as f:
-            dense_obj = FlexUnpickler(f).load()
+        # Step 1: Dense — master ordering (CPU-safe load)
+        dense_obj     = _load_pkl_on_cpu(index_dir / "dense.pkl")
         dense_doc_ids: list[str] = getattr(dense_obj, "_doc_ids", [])
         dense_texts: list[str]   = getattr(dense_obj, "_texts", [])
 
@@ -546,20 +594,20 @@ class HybridRetriever:
         )
         self.n_docs = len(self.metadata)
 
-        # Step 3: BM25 aligned to Dense order
+        # Step 3: BM25
         self.bm25 = BM25Engine(
             index_dir / "bm25.pkl",
             self.metadata,
             dense_doc_ids,
         )
 
-        # Step 4: Semantic engine (v4 — always builds fresh FAISS from .npy)
+        # Step 4: Semantic engine
         self.semantic = SemanticEngine(
             index_dir / "dense.pkl",
             index_dir / "dense_matrix.npy",
         )
 
-        # Step 5: Skill inverted index (optional)
+        # Step 5: Skills index (optional)
         skills_path = index_dir / "skills.pkl"
         self._skills_obj = None
         if skills_path.exists():
@@ -600,8 +648,8 @@ class HybridRetriever:
             strategy = strategy_map.get(q, "unknown")
             bm25_per_query.append((q, strategy, scores))
 
-            w = (1.0  if strategy in ("original", "synonym") else
-                 1.2  if strategy == "related_tech" else
+            w = (1.0 if strategy in ("original", "synonym") else
+                 1.2 if strategy == "related_tech" else
                  0.6)
 
             bm25_agg += w * scores
@@ -618,10 +666,8 @@ class HybridRetriever:
 
         # ── 2. Semantic aggregate (batch) ─────────────────────────────────
         if queries:
-            # encode_queries_batch returns (n_queries, dim) — all L2-normed
-            query_vecs   = self.semantic.encode_queries_batch(queries)   # (n_q, dim)
-            # score_queries_batch returns (n_queries, n_docs)
-            dense_matrix = self.semantic.score_queries_batch(query_vecs) # (n_q, n_docs)
+            query_vecs   = self.semantic.encode_queries_batch(queries)
+            dense_matrix = self.semantic.score_queries_batch(query_vecs)
 
             q_weights = np.array([
                 1.0 if strategy_map.get(q, "unknown") in ("original", "synonym") else
@@ -629,7 +675,6 @@ class HybridRetriever:
                 for q in queries
             ], dtype=np.float32)
 
-            # Weighted average across queries → (n_docs,)
             dense_scores = np.average(dense_matrix, axis=0, weights=q_weights)
         else:
             dense_scores = np.zeros(self.n_docs, dtype=np.float32)
@@ -667,17 +712,9 @@ class HybridRetriever:
                 rrf_scores[idx] *= (1.0 + 0.3 * hit_count)
 
         # ── 6. Quality gates ──────────────────────────────────────────────
-        bm25_floor = 0.15
-
-        lexical_scores = bm25_agg.copy()
-        lexical_scores[~valid_mask] = 0.0
-
+        bm25_floor    = 0.15
         max_sem       = dense_scores.max() if self.n_docs > 0 else 0.0
         sem_threshold = max_sem * 0.75 if max_sem > 0 else 0.60
-
-        semantic_scores = dense_scores.copy()
-        semantic_scores[~valid_mask] = 0.0
-        semantic_scores[semantic_scores < sem_threshold] = 0.0
 
         hybrid_quality_mask = (
             (bm25_agg >= bm25_floor) |
@@ -692,41 +729,33 @@ class HybridRetriever:
             top_score   = score_arr.max()
             score_floor = top_score * SCORE_FLOOR_RATIO if top_score > 0 else 0.0
             records     = []
-
             for rank, idx in enumerate(np.argsort(score_arr)[::-1], start=1):
                 if score_arr[idx] < score_floor or rank > self.top_k:
                     break
                 cand = self.metadata[idx]
-
                 all_names = (
                     cand.get("core_skill_names", set()) |
                     cand.get("secondary_skill_names", set())
                 )
                 matched = [s for s in skill_tokens_raw if s in all_names]
-
                 doc_term_contrib = {
                     t: float(arr[idx])
                     for t, arr in term_contrib_agg.items()
                     if arr[idx] > 0
                 }
-
                 expl = build_explanation(
-                    candidate          = cand,
-                    matched_skills     = matched,
-                    bm25_score         = float(bm25_agg[idx]),
-                    dense_score        = float(dense_scores[idx]),
-                    rrf_score          = float(score_arr[idx]),
-                    rank               = rank,
-                    parsed_intent      = parsed,
-                    term_contributions = doc_term_contrib,
+                    candidate=cand, matched_skills=matched,
+                    bm25_score=float(bm25_agg[idx]),
+                    dense_score=float(dense_scores[idx]),
+                    rrf_score=float(score_arr[idx]),
+                    rank=rank, parsed_intent=parsed,
+                    term_contributions=doc_term_contrib,
                 )
-
                 primary_score = (
                     expl["rrf_score"]      if mode == "hybrid"  else
                     expl["bm25_score"]     if mode == "lexical" else
                     expl["semantic_score"]
                 )
-
                 records.append({
                     "rank":                rank,
                     "candidate_id":        cand.get("id"),
@@ -748,8 +777,7 @@ class HybridRetriever:
             return records
 
         hybrid_results = _build_records(rrf_scores, "hybrid")
-
-        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        elapsed_ms     = round((time.perf_counter() - t0) * 1000, 2)
 
         # ── 8. Per-query BM25 breakdown ───────────────────────────────────
         query_breakdown = []
@@ -785,7 +813,7 @@ class HybridRetriever:
 
         return {
             "hybrid": {
-                "meta":            {**meta_out, "mode": "hybrid",   "returned": len(hybrid_results)},
+                "meta":            {**meta_out, "mode": "hybrid", "returned": len(hybrid_results)},
                 "results":         hybrid_results,
                 "query_breakdown": query_breakdown,
             }
