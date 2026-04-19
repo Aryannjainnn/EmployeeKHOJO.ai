@@ -9,3 +9,4 @@ data/profiles.csv
 .venv/
 venv/
 .DS_Store
+data
