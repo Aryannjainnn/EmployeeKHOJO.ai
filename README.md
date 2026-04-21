@@ -153,18 +153,15 @@ A React 18 single-page app (`EmployeeKHOJO.aiSearch.jsx`) loaded via Babel stand
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/Aryannjainnn/hackathon_backprop_bandits.git
-cd path/to/hackathon_backprop_bandits
+git clone https://github.com/Aryannjainnn/EmployeeKHOJO.ai.git
+cd path/to/EmployeeKHOJO.ai
 pip install -r requirements.txt
 ```
 
 ### 2. Configure environment
 
-```bash
-cp .env.example .env
-```
 
-Edit `.env`:
+CREATE `.env`:
 
 ```env
 # Neo4j connection
@@ -188,8 +185,7 @@ Place your candidate profiles CSV at `data/profiles.csv`. The indexer is schema-
 ### 4. Build the search index
 
 ```bash
-cd build_database_and_kg_realtime
-python build_index.py
+python build_database_and_kg_realtime/build_index.py
 ```
 
 This produces BM25, FAISS, and skill inverted index artifacts under `data/`. For a dataset of ~1000 candidates this takes 2–5 minutes depending on GPU availability.
@@ -199,8 +195,7 @@ This produces BM25, FAISS, and skill inverted index artifacts under `data/`. For
 Ensure you have Ollama `qwen2.5:7b` installed in your system.
 
 ```bash
-cd build_database_and_kg_realtime
-python kg_watcher.py
+python build_database_and_kg_realtime/kg_watcher.py
 ```
 
 On first run this processes every row in `profiles.csv`. Subsequent runs only process changed rows. Leave it running to sync changes automatically.
