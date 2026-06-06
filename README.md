@@ -6,7 +6,7 @@
 
 ## What Is This?
 
-EmployeeKHOJO.ai is an end-to-end intelligent search and retrieval system built for HR candidate shortlisting. Given a natural-language recruiter query like *"senior Python developer fintech 5 years no Java"*, the system identifies intent, expands the query, retrieves relevant candidates through multiple complementary signals, re-ranks them intelligently, and explains every result in plain English — all in a single pipeline.
+EmployeeKHOJO.ai is an end-to-end intelligent search and retrieval system built for HR shortlisting candidates. Given a natural-language recruiter query like *"senior Python developer fintech 5 years no Java"*, the system identifies intent, expands the query, retrieves relevant candidates through multiple complementary signals, re-ranks them intelligently, and explains every result in plain English — all in a single pipeline.
 
 ---
 
