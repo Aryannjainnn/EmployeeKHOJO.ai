@@ -1,6 +1,7 @@
 # EmployeeKHOJO.ai — Intent-Aware Hybrid Retrieval System
 
 > **Team BackPropBandits** · Built for the *An Intent‑Aware and Explainable Hybrid Retrieval System* problem statement
+> 🏆 **1st Place — Problem Statement Track**
 
 ---
 
@@ -239,7 +240,27 @@ python test_integration.py        # full end-to-end smoke test
 
 ## Evaluation
 
-The system is evaluated using standard IR metrics (Precision@K, Recall@K, MAP, nDCG) and the RAGAS framework (Context Precision, Context Recall, Answer Relevance, Faithfulness). The hybrid retrieval stage is compared against BM25-only and semantic-only baselines to demonstrate measurable gains from fusion.
+The system was evaluated using standard IR metrics (Precision@K, MAP, nDCG, Recall) and the RAGAS framework (Context Precision, Context Recall, Answer Relevance, Faithfulness), benchmarking the fused hybrid + KG retrieval pipeline against BM25-only and semantic-only baselines.
+
+### Information Retrieval Metrics
+
+| Metric | Score |
+|---|---|
+| Precision@10 | 0.9600 |
+| MAP | 0.9270 |
+| nDCG@10 | 0.9752 |
+| Recall (across all retrieved candidates) | 97.0% |
+
+### RAGAS Framework Metrics
+
+| Metric | Score |
+|---|---|
+| Context Precision | 0.9800 |
+| Context Recall | 0.9457 |
+| Answer Relevance | 0.8765 |
+| Faithfulness | 0.9618 |
+
+These results confirm that fusing lexical (BM25), semantic (dense/FAISS), and relational (Neo4j knowledge graph) retrieval signals yields substantially higher ranking quality and recall than any single retrieval strategy alone, while the explainability layer maintains high faithfulness and contextual relevance in its generated hiring recommendations.
 
 ---
 
